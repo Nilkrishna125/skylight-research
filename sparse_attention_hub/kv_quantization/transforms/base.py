@@ -29,7 +29,7 @@ class KVTransform(ABC):
     def inverse(
         self, x: torch.Tensor, context: AttentionContext, state: Any
     ) -> torch.Tensor:
-        """Restore the original coordinate system, including RoPE when applicable."""
+        """Restore the original coordinate system."""
 
     def calibrate(self, samples: Any) -> None:
         raise NotImplementedError(
@@ -42,6 +42,8 @@ class KVTransform(ABC):
 
 
 class PendingTransform(KVTransform):
+    """Base for transforms that are not implemented yet: selecting one raises."""
+
     def __init__(self, config: KVTransformConfig) -> None:
         super().__init__(config)
         raise NotImplementedError(
@@ -57,3 +59,12 @@ class PendingTransform(KVTransform):
         self, x: torch.Tensor, context: AttentionContext, state: Any
     ) -> torch.Tensor:
         raise NotImplementedError
+
+
+def apply_rotation(x: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    """``x @ matrix`` over the last (head_dim) axis, computed in FP32."""
+    if x.shape[-1] != matrix.shape[0]:
+        raise ValueError(
+            f"head_dim {x.shape[-1]} does not match the {matrix.shape[0]}-dim rotation"
+        )
+    return x.float() @ matrix.to(device=x.device, dtype=torch.float32)

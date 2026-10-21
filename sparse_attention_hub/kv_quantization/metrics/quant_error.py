@@ -37,10 +37,10 @@ class QuantErrorMetric:
         state: TensorCacheState,
         layer_idx: int,
     ) -> None:
-        # Exclude FP sink and recent regions; evaluate only encoded token intervals.
-        if not state.chunks:
+        # Evaluate only quantized token ranges (any region); FP regions have no error.
+        starts = state.encoded_ranges()
+        if not starts:
             return
-        starts = [(c.start_token, c.start_token + c.token_count) for c in state.chunks]
         before = torch.cat([original[..., a:b, :] for a, b in starts], dim=-2)
         after = torch.cat([reconstructed[..., a:b, :] for a, b in starts], dim=-2)
         MicroMetricLogger().log(

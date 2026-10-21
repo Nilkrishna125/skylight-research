@@ -190,21 +190,26 @@ class ModelAdapterHF(ModelAdapter):
                     question_tokens = question_tokens.to(input_device)
 
                 if self._sparse_attention_available:
-                    context_outputs = self.model(
-                        context_tokens,
-                        past_key_values=None,
-                        use_cache=True,
-                        sparse_meta_data=sparse_meta_data,
-                    )
-
-                    with self.enable_sparse_mode():
-                        response_text = self._generate_response(
-                            question_tokens,
-                            context_outputs,
-                            sparse_meta_data,
-                            generation_kwargs,
-                            **kwargs,
+                    try:
+                        context_outputs = self.model(
+                            context_tokens,
+                            past_key_values=None,
+                            use_cache=True,
+                            sparse_meta_data=sparse_meta_data,
                         )
+
+                        with self.enable_sparse_mode():
+                            response_text = self._generate_response(
+                                question_tokens,
+                                context_outputs,
+                                sparse_meta_data,
+                                generation_kwargs,
+                                **kwargs,
+                            )
+                    finally:
+                        # Free the per-question KV quantization store, even on failure.
+                        if self.sparse_attention is not None:
+                            self.sparse_attention.clear_request_state(sparse_meta_data)
                 else:
                     context_outputs = self.model(
                         context_tokens,

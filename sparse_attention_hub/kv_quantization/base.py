@@ -8,11 +8,11 @@ import torch
 from sparse_attention_hub.metric_logging.logger import MicroMetricLogger
 
 from .cache.block import StoredChunk
-from .cache.store import CACHE_KEY, QuantizedKVStore
+from .cache.store import CACHE_KEY, Encoder, QuantizedKVStore
 from .context import AttentionContext, record_trace
 from .metrics.quant_error import QuantErrorMetric
 from .policies.cache.base import CachePolicy, CachePolicyConfig
-from .policies.cache.implementations.residual_policy import ResidualCachePolicyConfig
+from .policies.cache.implementations.default import DefaultCachePolicyConfig
 from .policies.precision.base import PrecisionPolicy, PrecisionPolicyConfig
 from .policies.precision.implementations.fixed import FixedPrecisionConfig
 from .quantizers.base import KVQuantizer, KVQuantizerConfig
@@ -35,7 +35,7 @@ class KVQuantizationConfig:
     precision_policy: PrecisionPolicyConfig = field(
         default_factory=FixedPrecisionConfig
     )
-    cache_policy: CachePolicyConfig = field(default_factory=ResidualCachePolicyConfig)
+    cache_policy: CachePolicyConfig = field(default_factory=DefaultCachePolicyConfig)
     store_codes: bool = False
     error_metric: bool = False
     quantize_prefill: bool = False
@@ -56,6 +56,22 @@ class KVQuantization:
         self.cache_policy = cast(
             CachePolicy, CachePolicyRegistry.create(config.cache_policy)
         )
+        self.cache_policy.validate_quantizers(
+            config.key_quantizer, config.value_quantizer
+        )
+        # Optional quantizers for the sink and local regions; None keeps them in FP.
+        self.region_quantizers: Dict[Tuple[str, str], KVQuantizer] = {}
+        for kind in ("key", "value"):
+            for region in ("sink", "local"):
+                region_config = (
+                    config.cache_policy.sink(kind)
+                    if region == "sink"
+                    else config.cache_policy.local(kind)
+                )
+                if region_config.quantizer is not None:
+                    self.region_quantizers[(kind, region)] = (
+                        KVQuantizer.create_from_config(region_config.quantizer)
+                    )
         self.error_metric = QuantErrorMetric() if config.error_metric else None
         self._owner = object()
 
@@ -72,7 +88,6 @@ class KVQuantization:
         *,
         phase: str = "decode",
         position_ids: Optional[torch.Tensor] = None,
-        rope_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if (
             not isinstance(layer_idx, int)
@@ -94,10 +109,14 @@ class KVQuantization:
 
         store = meta_data.get(CACHE_KEY)
         if store is None:
+            cache_policy = self.config.cache_policy
             store = QuantizedKVStore(
                 self._owner,
                 store_codes=self.config.store_codes,
-                num_sink_tokens=self.config.cache_policy.num_sink_tokens,
+                sink_tokens={
+                    "key": cache_policy.key_sink.tokens,
+                    "value": cache_policy.value_sink.tokens,
+                },
             )
             meta_data[CACHE_KEY] = store
             record_trace(meta_data, "QuantizedKVStore: create")
@@ -106,7 +125,12 @@ class KVQuantization:
                 "Metadata belongs to another quantization configuration; use a fresh request"
             )
 
-        imported = store.append(layer_idx, keys, values)
+        imported = store.append(
+            layer_idx,
+            keys,
+            values,
+            self._encoder(layer_idx, meta_data, phase, position_ids),
+        )
         record_trace(
             meta_data,
             "QuantizedKVStore.append: unseen suffix",
@@ -121,7 +145,6 @@ class KVQuantization:
             "before_attention",
             phase,
             position_ids,
-            rope_context,
         )
         reconstructed_keys, reconstructed_values = store.get(
             layer_idx, self._decode_chunk
@@ -144,43 +167,82 @@ class KVQuantization:
             )
         return reconstructed_keys, reconstructed_values
 
+    def _quantizer_for(self, kind: str, region: str) -> Optional[KVQuantizer]:
+        """Middle uses the main quantizer; sink/local use theirs, or None for FP."""
+        if region == "middle":
+            return self.key_quantizer if kind == "key" else self.value_quantizer
+        return self.region_quantizers.get((kind, region))
+
+    def _encoder(
+        self,
+        layer_idx: int,
+        metadata: Dict[str, Any],
+        phase: str,
+        position_ids: Optional[torch.Tensor],
+    ) -> Encoder:
+        def encode(
+            kind: str, region: str, tensor: torch.Tensor, start: int
+        ) -> StoredChunk:
+            return self._encode_chunk(
+                kind, region, tensor, start, layer_idx, metadata, phase, position_ids
+            )
+
+        return encode
+
     def _encode_chunk(
         self,
         kind: str,
+        region: str,
         tensor: torch.Tensor,
         start: int,
         layer_idx: int,
         metadata: Dict[str, Any],
         phase: str,
         position_ids: Optional[torch.Tensor],
-        rope_context: Optional[Dict[str, Any]],
     ) -> StoredChunk:
-        context = AttentionContext(
-            layer_idx, kind, start, phase, position_ids, rope_context
-        )
+        token_count = int(tensor.shape[-2])
+        quantizer = self._quantizer_for(kind, region)
+        if quantizer is None:
+            return StoredChunk(
+                start,
+                token_count,
+                region=region,
+                full_precision=tensor.detach().clone(),
+            )
+        context = AttentionContext(layer_idx, kind, start, phase, position_ids)
         transform = self.key_transform if kind == "key" else self.value_transform
-        quantizer = self.key_quantizer if kind == "key" else self.value_quantizer
         record_trace(
-            metadata, "KVTransform.forward", layer=layer_idx, kind=kind, start=start
+            metadata,
+            "KVTransform.forward",
+            layer=layer_idx,
+            kind=kind,
+            region=region,
+            start=start,
         )
         transformed, saved = transform.forward(tensor, context)
-        positions = torch.arange(start, start + tensor.shape[-2], device=tensor.device)
-        plan = self.precision_policy.bits_for(
-            layer_idx,
-            transformed,
-            positions,
-            tensor_kind=kind,
-            default_bits=quantizer.config.bits,
-        )
+        if region == "middle":
+            positions = torch.arange(start, start + token_count, device=tensor.device)
+            plan = self.precision_policy.bits_for(
+                layer_idx,
+                transformed,
+                positions,
+                tensor_kind=kind,
+                default_bits=quantizer.config.bits,
+            )
+        else:
+            plan = None  # Sink and local regions use their quantizer's own bits.
         record_trace(
             metadata,
             "PrecisionPolicy.bits_for -> KVQuantizer.quantize",
             layer=layer_idx,
             kind=kind,
-            bits=plan.bits,
+            region=region,
+            bits=quantizer.config.bits if plan is None else plan.bits,
         )
         encoded = quantizer.quantize(transformed, plan)
-        chunk = StoredChunk(start, tensor.shape[-2], context, transform_state=saved)
+        chunk = StoredChunk(
+            start, token_count, context, transform_state=saved, region=region
+        )
         if self.config.store_codes:
             chunk.quantized = encoded
         else:
@@ -196,11 +258,13 @@ class KVQuantization:
         return chunk
 
     def _decode_chunk(self, kind: str, chunk: StoredChunk) -> torch.Tensor:
+        if chunk.full_precision is not None:
+            return chunk.full_precision
         if chunk.dequantized is not None:
             return chunk.dequantized
-        quantizer = self.key_quantizer if kind == "key" else self.value_quantizer
+        quantizer = self._quantizer_for(kind, chunk.region)
         transform = self.key_transform if kind == "key" else self.value_transform
-        assert chunk.quantized is not None
+        assert chunk.quantized is not None and quantizer is not None
         return transform.inverse(
             quantizer.dequantize(chunk.quantized),
             chunk.context,
@@ -215,21 +279,14 @@ class KVQuantization:
         timing: str,
         phase: str,
         position_ids: Optional[torch.Tensor],
-        rope_context: Optional[Dict[str, Any]],
     ) -> None:
-        def encode(kind: str, tensor: torch.Tensor, start: int) -> StoredChunk:
-            return self._encode_chunk(
-                kind,
-                tensor,
-                start,
-                layer_idx,
-                metadata,
-                phase,
-                position_ids,
-                rope_context,
-            )
-
-        store.compress_ready(layer_idx, self.cache_policy, encode, phase=timing)
+        store.compress_ready(
+            layer_idx,
+            self.cache_policy,
+            self._encoder(layer_idx, metadata, phase, position_ids),
+            self._decode_chunk,
+            phase=timing,
+        )
 
     def after_attention(
         self,
@@ -238,7 +295,6 @@ class KVQuantization:
         *,
         phase: str = "decode",
         position_ids: Optional[torch.Tensor] = None,
-        rope_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         store = meta_data.get(CACHE_KEY)
         if store is not None:
@@ -249,7 +305,6 @@ class KVQuantization:
                 "after_attention",
                 phase,
                 position_ids,
-                rope_context,
             )
             self.cache_policy.after_attention(store, layer_idx)
 

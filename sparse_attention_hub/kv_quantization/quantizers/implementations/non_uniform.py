@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ...registry import KVQuantizerRegistry
-from ..base import CodebookQuantizer, KVQuantizerConfig, PendingQuantizer
+from ..base import KVQuantizerConfig, PendingQuantizer
 
 
 @dataclass(frozen=True)
@@ -13,5 +13,5 @@ class NonUniformQuantizerConfig(KVQuantizerConfig):
 
 
 @KVQuantizerRegistry.register(NonUniformQuantizerConfig)
-class NonUniformQuantizer(PendingQuantizer, CodebookQuantizer):
+class NonUniformQuantizer(PendingQuantizer):
     """TODO: codebook construction/loading, indexing, outliers and norms."""

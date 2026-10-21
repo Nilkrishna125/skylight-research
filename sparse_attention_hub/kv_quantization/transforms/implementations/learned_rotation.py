@@ -13,4 +13,4 @@ class LearnedRotationConfig(KVTransformConfig):
 
 @KVTransformRegistry.register(LearnedRotationConfig)
 class LearnedRotation(PendingTransform):
-    """TODO: calibrated, persisted and versioned rotations."""
+    """TODO: calibrated (e.g. RotateKV-style), persisted and versioned rotations."""

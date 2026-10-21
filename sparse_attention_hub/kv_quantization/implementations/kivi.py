@@ -3,7 +3,9 @@
 from dataclasses import dataclass, field
 
 from ..base import KVQuantizationConfig, PendingRecipe
-from ..policies.cache.implementations.kivi_policy import KIVICachePolicyConfig
+from ..policies.cache.implementations.sink_and_local import (
+    SinkAndLocalCachePolicyConfig,
+)
 from ..quantizers.base import QuantGranularity
 from ..quantizers.implementations.integer import IntQuantizerConfig
 from ..registry import KVQuantizationRegistry
@@ -19,9 +21,11 @@ class KIVIConfig(KVQuantizationConfig):
     value_quantizer: IntQuantizerConfig = field(
         default_factory=lambda: IntQuantizerConfig(bits=2)
     )
-    cache_policy: KIVICachePolicyConfig = field(default_factory=KIVICachePolicyConfig)
+    cache_policy: SinkAndLocalCachePolicyConfig = field(
+        default_factory=SinkAndLocalCachePolicyConfig
+    )
 
 
 @KVQuantizationRegistry.register(KIVIConfig)
 class KIVI(PendingRecipe):
-    """TODO: faithful KIVI grouping, K/V buffers and phase timing."""
+    """TODO: validate against the reference KIVI implementation."""

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 from ...registry import KVQuantizerRegistry
-from ..base import KVQuantizerConfig, PendingQuantizer, ScalarQuantizer
+from ..base import KVQuantizerConfig, PendingQuantizer
 
 
 @dataclass(frozen=True)
@@ -12,5 +12,5 @@ class MXFPQuantizerConfig(KVQuantizerConfig):
 
 
 @KVQuantizerRegistry.register(MXFPQuantizerConfig)
-class MXFPQuantizer(PendingQuantizer, ScalarQuantizer):
+class MXFPQuantizer(PendingQuantizer):
     """TODO: format-dependent codes, E8M0 scales and block layout."""

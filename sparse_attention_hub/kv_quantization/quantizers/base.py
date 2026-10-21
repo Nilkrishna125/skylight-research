@@ -18,12 +18,44 @@ class QuantGranularity(str, Enum):
     PER_BLOCK = "per_block"
 
 
+class ParamDType(str, Enum):
+    """Data type used to store per-group quantization parameters."""
+
+    FP32 = "fp32"
+    FP16 = "fp16"
+    BF16 = "bf16"
+
+    @property
+    def torch_dtype(self) -> torch.dtype:
+        return {
+            ParamDType.FP32: torch.float32,
+            ParamDType.FP16: torch.float16,
+            ParamDType.BF16: torch.bfloat16,
+        }[self]
+
+
 @dataclass(frozen=True)
 class KVQuantizerConfig:
+    """Settings shared by every quantizer.
+
+    Attributes:
+        bits: Bits per stored code.
+        granularity: Which values share one scale (and offset).
+        group_size: How many values share one scale (and offset).
+        symmetric: Signed range around zero with no offset, or an asymmetric
+            range with an offset (the group minimum).
+        scale_dtype: How each group's scale is stored. 16-bit types halve the
+            overhead of fp32; codes are computed with the stored (rounded) value.
+        offset_dtype: How each group's offset is stored (asymmetric only). bf16
+            has few mantissa bits, so offsets far from zero lose precision.
+    """
+
     bits: int = 4
     granularity: QuantGranularity = QuantGranularity.PER_TOKEN
     group_size: int = 32
     symmetric: bool = False
+    scale_dtype: ParamDType = ParamDType.FP16
+    offset_dtype: ParamDType = ParamDType.FP16
 
 
 class KVQuantizer(ABC):
@@ -55,15 +87,9 @@ class KVQuantizer(ABC):
         return cast(KVQuantizer, KVQuantizerRegistry.create(config))
 
 
-class ScalarQuantizer(KVQuantizer):
-    """Fixed numerical-format family in the diagram (also scalar codebooks exist)."""
-
-
-class CodebookQuantizer(KVQuantizer):
-    """TODO: fitted/analytic codebooks, calibration artifacts and decoding."""
-
-
 class PendingQuantizer(KVQuantizer):
+    """Base for formats that are not implemented yet: selecting one raises."""
+
     def __init__(self, config: KVQuantizerConfig) -> None:
         super().__init__(config)
         raise NotImplementedError(

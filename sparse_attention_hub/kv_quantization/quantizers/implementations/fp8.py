@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 from ...registry import KVQuantizerRegistry
-from ..base import KVQuantizerConfig, PendingQuantizer, ScalarQuantizer
+from ..base import KVQuantizerConfig, PendingQuantizer
 
 
 @dataclass(frozen=True)
@@ -13,5 +13,5 @@ class FP8QuantizerConfig(KVQuantizerConfig):
 
 
 @KVQuantizerRegistry.register(FP8QuantizerConfig)
-class FP8Quantizer(PendingQuantizer, ScalarQuantizer):
+class FP8Quantizer(PendingQuantizer):
     """TODO: format-specific rounding, clipping, scale and storage."""

@@ -3,16 +3,20 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-import torch
-
 from .block import StoredChunk
 
 
 @dataclass
 class TensorCacheState:
-    sink: Optional[torch.Tensor] = None
-    recent: Optional[torch.Tensor] = None
-    chunks: List[StoredChunk] = field(default_factory=list)
+    """One tensor kind's history as three ordered regions of stored chunks."""
+
+    sink: List[StoredChunk] = field(default_factory=list)
+    chunks: List[StoredChunk] = field(default_factory=list)  # middle region
+    recent: List[StoredChunk] = field(default_factory=list)  # local window
+
+    @property
+    def sink_tokens(self) -> int:
+        return sum(chunk.token_count for chunk in self.sink)
 
     @property
     def compressed_tokens(self) -> int:
@@ -20,11 +24,19 @@ class TensorCacheState:
 
     @property
     def recent_tokens(self) -> int:
-        return 0 if self.recent is None else self.recent.shape[-2]
+        return sum(chunk.token_count for chunk in self.recent)
 
-    @property
-    def sink_tokens(self) -> int:
-        return 0 if self.sink is None else self.sink.shape[-2]
+    def all_chunks(self) -> List[StoredChunk]:
+        """Every chunk in token order: sink, middle, local."""
+        return [*self.sink, *self.chunks, *self.recent]
+
+    def encoded_ranges(self) -> List[Tuple[int, int]]:
+        """Token ranges [start, end) that are stored quantized, in any region."""
+        return [
+            (chunk.start_token, chunk.start_token + chunk.token_count)
+            for chunk in self.all_chunks()
+            if chunk.is_encoded
+        ]
 
 
 @dataclass

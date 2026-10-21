@@ -5,16 +5,18 @@ from dataclasses import dataclass, field
 from ..base import KVQuantizationConfig, PendingRecipe
 from ..quantizers.implementations.integer import IntQuantizerConfig
 from ..registry import KVQuantizationRegistry
-from ..transforms.implementations.hadamard import HadamardTransformConfig
+from ..transforms.implementations.random_hadamard import (
+    RandomHadamardTransformConfig,
+)
 
 
 @dataclass(frozen=True)
 class QuaRotKVConfig(KVQuantizationConfig):
-    key_transform: HadamardTransformConfig = field(
-        default_factory=HadamardTransformConfig
+    key_transform: RandomHadamardTransformConfig = field(
+        default_factory=RandomHadamardTransformConfig
     )
-    value_transform: HadamardTransformConfig = field(
-        default_factory=HadamardTransformConfig
+    value_transform: RandomHadamardTransformConfig = field(
+        default_factory=RandomHadamardTransformConfig
     )
     key_quantizer: IntQuantizerConfig = field(
         default_factory=lambda: IntQuantizerConfig(group_size=128)

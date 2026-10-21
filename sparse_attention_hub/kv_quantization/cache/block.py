@@ -44,9 +44,21 @@ class QuantizedTensor:
 
 @dataclass
 class StoredChunk:
+    """A run of consecutive tokens in one region (``sink``, ``middle`` or ``local``).
+
+    Exactly one representation is set: ``full_precision`` (kept as received),
+    ``quantized`` (codes, PACKED mode) or ``dequantized`` (reconstruction, FAKE mode).
+    """
+
     start_token: int
     token_count: int
-    context: AttentionContext
+    context: Optional[AttentionContext] = None
     transform_state: Any = None
     quantized: Optional[QuantizedTensor] = None
     dequantized: Optional[torch.Tensor] = None
+    region: str = "middle"
+    full_precision: Optional[torch.Tensor] = None
+
+    @property
+    def is_encoded(self) -> bool:
+        return self.full_precision is None

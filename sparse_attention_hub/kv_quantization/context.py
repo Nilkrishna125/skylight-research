@@ -13,7 +13,6 @@ class AttentionContext:
     start_token: int
     phase: str = "decode"
     position_ids: Optional[torch.Tensor] = None
-    rope_context: Optional[Dict[str, Any]] = None
 
 
 def record_trace(metadata: Dict[str, Any], stage: str, **details: Any) -> None:

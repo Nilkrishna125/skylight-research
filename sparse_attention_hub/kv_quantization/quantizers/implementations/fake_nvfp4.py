@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 from ...registry import KVQuantizerRegistry
-from ..base import PendingQuantizer, ScalarQuantizer
+from ..base import PendingQuantizer
 from .nvfp4 import NVFP4QuantizerConfig
 
 
@@ -13,5 +13,5 @@ class FakeNVFP4QuantizerConfig(NVFP4QuantizerConfig):
 
 
 @KVQuantizerRegistry.register(FakeNVFP4QuantizerConfig)
-class FakeNVFP4Quantizer(PendingQuantizer, ScalarQuantizer):
+class FakeNVFP4Quantizer(PendingQuantizer):
     """TODO: match the NVFP4 codec's numbers without native FP4 hardware."""

@@ -1,16 +1,55 @@
-"""HadamardTransform component and its configuration."""
+"""HadamardTransform: a normalized Hadamard rotation."""
 
 from dataclasses import dataclass
+from typing import Any, Dict, Tuple
 
+import torch
+
+from ...context import AttentionContext
 from ...registry import KVTransformRegistry
-from ..base import KVTransformConfig, PendingTransform
+from ..base import KVTransform, KVTransformConfig, apply_rotation
 
 
 @dataclass(frozen=True)
 class HadamardTransformConfig(KVTransformConfig):
-    pass
+    """Rotate each key/value vector by the normalized Hadamard matrix H."""
+
+
+def hadamard_matrix(size: int) -> torch.Tensor:
+    """Normalized Sylvester Hadamard matrix (``H @ H.T == I``); ``size`` a power of 2."""
+    if size < 1 or size & (size - 1):
+        raise ValueError(f"Hadamard needs head_dim to be a power of 2, got {size}")
+    matrix = torch.ones(1, 1)
+    while matrix.shape[0] < size:
+        matrix = torch.cat(
+            [torch.cat([matrix, matrix], 1), torch.cat([matrix, -matrix], 1)], 0
+        )
+    return matrix / size**0.5
 
 
 @KVTransformRegistry.register(HadamardTransformConfig)
-class HadamardTransform(PendingTransform):
-    """TODO: normalized Hadamard transform, dimension validation and inverse."""
+class HadamardTransform(KVTransform):
+    """Spreads outlier channels across all channels before quantization.
+
+    H is orthogonal, so ``inverse`` (multiplying by its transpose) restores the
+    original coordinates exactly up to FP32 rounding.
+    """
+
+    def __init__(self, config: HadamardTransformConfig) -> None:
+        super().__init__(config)
+        self._matrices: Dict[int, torch.Tensor] = {}
+
+    def matrix(self, size: int) -> torch.Tensor:
+        if size not in self._matrices:
+            self._matrices[size] = hadamard_matrix(size)
+        return self._matrices[size]
+
+    def forward(
+        self, x: torch.Tensor, context: AttentionContext
+    ) -> Tuple[torch.Tensor, Any]:
+        return apply_rotation(x, self.matrix(x.shape[-1])), x.dtype
+
+    def inverse(
+        self, x: torch.Tensor, context: AttentionContext, state: Any
+    ) -> torch.Tensor:
+        return apply_rotation(x, self.matrix(x.shape[-1]).T).to(state)

@@ -133,6 +133,9 @@ class ResearchAttention(SparseAttention):
             )
         sparse_meta_data: Dict[Any, Any] = kwargs.pop("sparse_meta_data")
 
+        # KV quantization runs on every layer, independently of the gating below.
+        keys, values = self.quantize_kv(keys, values, sparse_meta_data, **kwargs)
+
         # Layer-type gating: run exact dense attention on excluded layers and emit no
         # micro-metrics for them. The mask HuggingFace passed in is already the correct
         # per-layer mask (e.g. causal AND sliding-window), so this reproduces the model's

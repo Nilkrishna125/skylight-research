@@ -15,18 +15,30 @@ from .implementations.turboquant_kv import (  # noqa: F401
     TurboQuantKVConfig,
 )
 from .metrics.quant_error import QuantErrorMetric  # noqa: F401
-from .policies.cache.base import CachePolicy, CachePolicyConfig  # noqa: F401
-from .policies.cache.implementations.kitty_policy import (  # noqa: F401
+from .policies.cache.base import (  # noqa: F401
+    CachePolicy,
+    CachePolicyConfig,
+    RegionConfig,
+)
+from .policies.cache.implementations.default import (  # noqa: F401
+    DefaultCachePolicy,
+    DefaultCachePolicyConfig,
+)
+from .policies.cache.implementations.immediate import (  # noqa: F401
+    FullQuantizationCachePolicy,
+    FullQuantizationCachePolicyConfig,
+    SinkOnlyCachePolicy,
+    SinkOnlyCachePolicyConfig,
+)
+from .policies.cache.implementations.local_only import (  # noqa: F401
+    LocalOnlyCachePolicy,
+    LocalOnlyCachePolicyConfig,
+)
+from .policies.cache.implementations.sink_and_local import (  # noqa: F401
     KittyCachePolicy,
     KittyCachePolicyConfig,
-)
-from .policies.cache.implementations.kivi_policy import (  # noqa: F401
-    KIVICachePolicy,
-    KIVICachePolicyConfig,
-)
-from .policies.cache.implementations.residual_policy import (  # noqa: F401
-    ResidualCachePolicy,
-    ResidualCachePolicyConfig,
+    SinkAndLocalCachePolicy,
+    SinkAndLocalCachePolicyConfig,
 )
 from .policies.precision.base import (  # noqa: F401
     PrecisionPlan,
@@ -46,11 +58,10 @@ from .policies.precision.implementations.outlier_token import (  # noqa: F401
     OutlierTokenPolicyConfig,
 )
 from .quantizers.base import (  # noqa: F401
-    CodebookQuantizer,
     KVQuantizer,
     KVQuantizerConfig,
+    ParamDType,
     QuantGranularity,
-    ScalarQuantizer,
 )
 from .quantizers.implementations.fake_nvfp4 import (  # noqa: F401
     FakeNVFP4Quantizer,
@@ -84,10 +95,6 @@ from .registry import (  # noqa: F401
     PrecisionPolicyRegistry,
 )
 from .transforms.base import KVTransform, KVTransformConfig  # noqa: F401
-from .transforms.implementations.composite import (  # noqa: F401
-    CompositeTransform,
-    CompositeTransformConfig,
-)
 from .transforms.implementations.hadamard import (  # noqa: F401
     HadamardTransform,
     HadamardTransformConfig,
@@ -96,6 +103,10 @@ from .transforms.implementations.identity import (  # noqa: F401
     IdentityTransform,
     IdentityTransformConfig,
 )
+from .transforms.implementations.random_hadamard import (  # noqa: F401
+    RandomHadamardTransform,
+    RandomHadamardTransformConfig,
+)
 from .transforms.implementations.learned_rotation import (  # noqa: F401
     LearnedRotation,
     LearnedRotationConfig,
@@ -103,8 +114,4 @@ from .transforms.implementations.learned_rotation import (  # noqa: F401
 from .transforms.implementations.random_rotation import (  # noqa: F401
     RandomRotation,
     RandomRotationConfig,
-)
-from .transforms.implementations.rope_inverse import (  # noqa: F401
-    RoPEInverse,
-    RoPEInverseConfig,
 )

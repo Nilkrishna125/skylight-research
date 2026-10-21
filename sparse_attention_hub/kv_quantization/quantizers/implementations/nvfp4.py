@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 from ...registry import KVQuantizerRegistry
-from ..base import KVQuantizerConfig, PendingQuantizer, ScalarQuantizer
+from ..base import KVQuantizerConfig, PendingQuantizer
 
 
 @dataclass(frozen=True)
@@ -13,5 +13,5 @@ class NVFP4QuantizerConfig(KVQuantizerConfig):
 
 
 @KVQuantizerRegistry.register(NVFP4QuantizerConfig)
-class NVFP4Quantizer(PendingQuantizer, ScalarQuantizer):
+class NVFP4Quantizer(PendingQuantizer):
     """TODO: E2M1 payload, E4M3 block scales, FP32 global scale and packing."""
