@@ -26,6 +26,7 @@ class QuantizedTensor:
     codebook: Optional[torch.Tensor] = None
     outlier_indices: Optional[torch.Tensor] = None
     outlier_values: Optional[torch.Tensor] = None
+    group_bits: Optional[torch.Tensor] = None  # bits per group, for mixed precision
 
     def storage_bytes(self) -> int:
         """Tensor storage only; excludes Python objects and shared calibration data."""
@@ -38,6 +39,7 @@ class QuantizedTensor:
             self.codebook,
             self.outlier_indices,
             self.outlier_values,
+            self.group_bits,
         ]
         return sum(t.numel() * t.element_size() for t in tensors if t is not None)
 
@@ -58,6 +60,10 @@ class StoredChunk:
     dequantized: Optional[torch.Tensor] = None
     region: str = "middle"
     full_precision: Optional[torch.Tensor] = None
+    # Tokens a precision plan kept in their original precision: flat indices into
+    # [batch * heads * tokens] and their values [kept, head_dim].
+    kept_index: Optional[torch.Tensor] = None
+    kept_values: Optional[torch.Tensor] = None
 
     @property
     def is_encoded(self) -> bool:

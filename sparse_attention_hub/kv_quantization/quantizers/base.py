@@ -8,6 +8,7 @@ from typing import Any, Optional, cast
 import torch
 
 from ..cache.block import QuantizedTensor
+from ..context import AttentionContext
 from ..policies.precision.base import PrecisionPlan
 from ..registry import KVQuantizerRegistry
 
@@ -64,18 +65,30 @@ class KVQuantizer(ABC):
 
     @abstractmethod
     def quantize(
-        self, x: torch.Tensor, plan: Optional[PrecisionPlan] = None
+        self,
+        x: torch.Tensor,
+        plan: Optional[PrecisionPlan] = None,
+        *,
+        context: Optional[AttentionContext] = None,
     ) -> QuantizedTensor:
-        """Encode with the supplied precision plan, including layout metadata."""
+        """Encode with the supplied precision plan, including layout metadata.
+
+        ``context`` says which layer and tensor kind ``x`` belongs to; quantizers with
+        per-layer state (calibrated tables) need it, the others ignore it.
+        """
 
     @abstractmethod
     def dequantize(self, q: QuantizedTensor) -> torch.Tensor:
         """Restore the original shape, dtype and device."""
 
     def fake_quantize(
-        self, x: torch.Tensor, plan: Optional[PrecisionPlan] = None
+        self,
+        x: torch.Tensor,
+        plan: Optional[PrecisionPlan] = None,
+        *,
+        context: Optional[AttentionContext] = None,
     ) -> torch.Tensor:
-        return self.dequantize(self.quantize(x, plan))
+        return self.dequantize(self.quantize(x, plan, context=context))
 
     def calibrate(self, samples: Any) -> None:
         raise NotImplementedError(
@@ -97,7 +110,11 @@ class PendingQuantizer(KVQuantizer):
         )
 
     def quantize(
-        self, x: torch.Tensor, plan: Optional[PrecisionPlan] = None
+        self,
+        x: torch.Tensor,
+        plan: Optional[PrecisionPlan] = None,
+        *,
+        context: Optional[AttentionContext] = None,
     ) -> QuantizedTensor:
         raise NotImplementedError
 

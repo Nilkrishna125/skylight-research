@@ -6,9 +6,20 @@ from typing import Optional
 import torch
 
 from ...cache.block import QuantizedTensor
+from ...context import AttentionContext
 from ...policies.precision.base import PrecisionPlan
 from ...registry import KVQuantizerRegistry
-from ..base import KVQuantizer, KVQuantizerConfig, ParamDType, QuantGranularity
+from ..base import KVQuantizer, KVQuantizerConfig, QuantGranularity
+from ..common import (
+    check_input,
+    group_values,
+    layout_from_metadata,
+    layout_metadata,
+    pack_codes,
+    store_param,
+    ungroup_values,
+    unpack_codes,
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +35,10 @@ class IntQuantizer(KVQuantizer):
     consecutive channels of one token (``group_size`` must divide head_dim, so a
     block never spans two tokens). Padding repeats the last entry so it cannot
     change a group's min/max.
+
+    A plan's ``channel_bits`` (mixed precision, e.g. ChannelBoost) needs PER_CHANNEL
+    groups, so every group has one bit width. Codes of each width are packed
+    separately; one byte per group records its width.
     """
 
     def __init__(self, config: IntQuantizerConfig) -> None:
@@ -35,44 +50,19 @@ class IntQuantizer(KVQuantizer):
         self.granularity = QuantGranularity(config.granularity)
 
     def quantize(
-        self, x: torch.Tensor, plan: Optional[PrecisionPlan] = None
+        self,
+        x: torch.Tensor,
+        plan: Optional[PrecisionPlan] = None,
+        *,
+        context: Optional[AttentionContext] = None,
     ) -> QuantizedTensor:
-        if x.ndim != 4 or not x.is_floating_point() or x.numel() == 0:
-            raise ValueError(
-                "Expected a nonempty floating tensor [batch, kv_heads, tokens, channels]"
-            )
-        if not torch.isfinite(x).all():
-            raise ValueError("Cannot quantize NaN or infinity")
-        if plan is not None and plan.assignments is not None:
-            raise NotImplementedError(
-                "Mixed-bit packing is not implemented; use FixedPrecision"
-            )
+        check_input(x, plan, allow_channel_bits=True)
         bits = self.config.bits if plan is None else plan.bits
         if bits not in (2, 4, 8):
             raise ValueError("INT precision plan must use 2, 4 or 8 bits")
-
-        if (
-            self.granularity == QuantGranularity.PER_BLOCK
-            and x.shape[-1] % self.config.group_size
-        ):
-            raise ValueError(
-                f"PER_BLOCK needs group_size ({self.config.group_size}) to divide "
-                f"head_dim ({x.shape[-1]}) so that no block spans two tokens"
-            )
-        axis = 2 if self.granularity == QuantGranularity.PER_CHANNEL else 3
-        if self.granularity == QuantGranularity.PER_BLOCK:
-            data = x.detach().float().flatten(start_dim=2)
-        else:
-            data = x.detach().float().movedim(axis, -1)
-        layout_shape = tuple(data.shape)
-        size = self.config.group_size
-        padding = (-data.shape[-1]) % size
-        if padding:
-            data = torch.cat(
-                [data, data[..., -1:].expand(*data.shape[:-1], padding)], -1
-            )
-        padded_length = data.shape[-1]
-        groups = data.reshape(*data.shape[:-1], padded_length // size, size)
+        if plan is not None and plan.channel_bits is not None:
+            return self._quantize_mixed(x, plan.channel_bits, bits)
+        groups, layout = group_values(x, self.granularity, self.config.group_size)
         lo = groups.amin(dim=-1, keepdim=True)
         hi = groups.amax(dim=-1, keepdim=True)
 
@@ -82,26 +72,19 @@ class IntQuantizer(KVQuantizer):
         if self.config.symmetric:
             # Signed symmetric [-qmax, qmax], stored as unsigned codes; no offset.
             qmax = 2 ** (bits - 1) - 1
-            scale = _store(
+            scale = store_param(
                 torch.maximum(lo.abs(), hi.abs()) / qmax, self.config.scale_dtype
             )
             offset = None
             codes = (groups / scale).round().clamp(-qmax, qmax) + qmax
         else:
-            offset = _store(lo, self.config.offset_dtype, kind="offset")
-            scale = _store((hi - offset) / (2**bits - 1), self.config.scale_dtype)
+            offset = store_param(lo, self.config.offset_dtype, kind="offset")
+            scale = store_param((hi - offset) / (2**bits - 1), self.config.scale_dtype)
             # A constant group decodes to its offset (exact when the offset dtype
             # represents the value).
             codes = ((groups - offset) / scale).round().clamp(0, 2**bits - 1)
 
-        flat = codes.to(torch.int16).flatten()
-        entries_per_byte = 8 // bits
-        code_count = flat.numel()
-        pack_padding = (-code_count) % entries_per_byte
-        if pack_padding:
-            flat = torch.cat([flat, flat.new_zeros(pack_padding)])
-        shifts = torch.arange(entries_per_byte, device=x.device) * bits
-        packed = (flat.reshape(-1, entries_per_byte) << shifts).sum(-1).to(torch.uint8)
+        packed, code_count = pack_codes(codes, bits)
         return QuantizedTensor(
             codes=packed,
             scales=scale.to(self.config.scale_dtype.torch_dtype).contiguous(),
@@ -114,70 +97,120 @@ class IntQuantizer(KVQuantizer):
             shape=tuple(x.shape),
             dtype=x.dtype,
             device=x.device,
-            axis=axis,
+            axis=layout.axis,
             bits=bits,
             format_id="uniform_int_v1",
-            group_size=size,
+            group_size=self.config.group_size,
             metadata={
-                "layout_shape": layout_shape,
-                "padded_length": padded_length,
-                "code_count": code_count,
-                "granularity": self.granularity.value,
+                **layout_metadata(layout, code_count),
                 "symmetric": self.config.symmetric,
             },
         )
 
+    def _quantize_mixed(
+        self, x: torch.Tensor, channel_bits: torch.Tensor, default_bits: int
+    ) -> QuantizedTensor:
+        """Per-channel bit widths: every PER_CHANNEL group has its channel's width."""
+        if self.granularity != QuantGranularity.PER_CHANNEL:
+            raise ValueError(
+                "Per-channel bits need PER_CHANNEL granularity, so each group has "
+                "one bit width"
+            )
+        if tuple(channel_bits.shape) != (x.shape[0], x.shape[1], x.shape[3]):
+            raise ValueError("channel_bits must have shape [batch, heads, head_dim]")
+        widths = sorted(int(w) for w in channel_bits.unique())
+        if any(w not in (2, 4, 8) for w in widths):
+            raise ValueError("Per-channel bits must be 2, 4 or 8")
+        groups, layout = group_values(x, self.granularity, self.config.group_size)
+        # groups: [batch, heads, channels, n_groups, size]; one width per channel.
+        group_bits = channel_bits.to(groups.device)[..., None].expand(groups.shape[:-1])
+        bits = group_bits[..., None].float()
+        lo = groups.amin(dim=-1, keepdim=True)
+        hi = groups.amax(dim=-1, keepdim=True)
+        offset: Optional[torch.Tensor]
+        if self.config.symmetric:
+            qmax = 2 ** (bits - 1) - 1
+            scale = store_param(
+                torch.maximum(lo.abs(), hi.abs()) / qmax, self.config.scale_dtype
+            )
+            offset = None
+            codes = torch.minimum(torch.maximum((groups / scale).round(), -qmax), qmax)
+            codes = codes + qmax
+        else:
+            levels = 2**bits - 1
+            offset = store_param(lo, self.config.offset_dtype, kind="offset")
+            scale = store_param((hi - offset) / levels, self.config.scale_dtype)
+            codes = torch.minimum(((groups - offset) / scale).round().clamp(min=0), levels)
+
+        flat_bits = group_bits.flatten()
+        flat_codes = codes.reshape(-1, groups.shape[-1])
+        parts, counts, byte_counts = [], [], []
+        for width in widths:
+            packed, count = pack_codes(flat_codes[flat_bits == width], width)
+            parts.append(packed)
+            counts.append(count)
+            byte_counts.append(packed.numel())
+        return QuantizedTensor(
+            codes=torch.cat(parts),
+            scales=scale.to(self.config.scale_dtype.torch_dtype).contiguous(),
+            zero_points=(
+                None
+                if offset is None
+                else offset.to(self.config.offset_dtype.torch_dtype).contiguous()
+            ),
+            shape=tuple(x.shape),
+            dtype=x.dtype,
+            device=x.device,
+            axis=layout.axis,
+            bits=default_bits,
+            format_id="uniform_int_v1",
+            group_size=self.config.group_size,
+            metadata={
+                **layout_metadata(layout, flat_codes.numel()),
+                "symmetric": self.config.symmetric,
+                "widths": widths,
+                "width_code_counts": counts,
+                "width_byte_counts": byte_counts,
+            },
+            group_bits=flat_bits.to(torch.uint8).contiguous(),
+        )
+
+    def _unpack_mixed(self, q: QuantizedTensor) -> torch.Tensor:
+        assert q.group_bits is not None
+        flat_bits = q.group_bits.long()
+        codes = torch.zeros(
+            flat_bits.numel(), q.group_size, dtype=torch.float32, device=q.codes.device
+        )
+        start = 0
+        for width, count, nbytes in zip(
+            q.metadata["widths"],
+            q.metadata["width_code_counts"],
+            q.metadata["width_byte_counts"],
+        ):
+            part = unpack_codes(q.codes[start : start + nbytes], width, count)
+            codes[flat_bits == width] = part.float().reshape(-1, q.group_size)
+            start += nbytes
+        return codes
+
     def dequantize(self, q: QuantizedTensor) -> torch.Tensor:
         if q.format_id != "uniform_int_v1":
             raise ValueError(f"Unsupported integer encoding: {q.format_id}")
-        entries_per_byte = 8 // q.bits
-        shifts = torch.arange(entries_per_byte, device=q.codes.device) * q.bits
-        flat = (
-            (q.codes.to(torch.int16)[:, None] >> shifts) & (2**q.bits - 1)
-        ).flatten()
-        flat = flat[: q.metadata["code_count"]].float()
-        layout_shape = q.metadata["layout_shape"]
-        padded = q.metadata["padded_length"]
-        groups = flat.reshape(*layout_shape[:-1], padded // q.group_size, q.group_size)
+        layout = layout_from_metadata(q.metadata, q.axis)
+        if q.group_bits is not None:
+            flat = self._unpack_mixed(q)
+            group_bits = q.group_bits.float().reshape(q.scales.shape)
+        else:
+            flat = unpack_codes(q.codes, q.bits, q.metadata["code_count"]).float()
+            group_bits = None
+        groups = flat.reshape(
+            *layout.layout_shape[:-1], layout.padded_length // q.group_size, q.group_size
+        )
         scales = q.scales.float()
         if q.metadata["symmetric"]:
-            restored = (groups - (2 ** (q.bits - 1) - 1)) * scales
+            bits = q.bits if group_bits is None else group_bits
+            restored = (groups - (2 ** (bits - 1) - 1)) * scales
         else:
             assert q.zero_points is not None
             restored = groups * scales + q.zero_points.float()
-        restored = restored.reshape(*layout_shape[:-1], padded)[..., : layout_shape[-1]]
-        if q.metadata["granularity"] == QuantGranularity.PER_BLOCK.value:
-            restored = restored.reshape(q.shape)
-        else:
-            restored = restored.movedim(-1, q.axis)
+        restored = ungroup_values(restored, layout, q.shape)
         return restored.to(device=q.device, dtype=q.dtype).contiguous()
-
-
-def _store(
-    values: torch.Tensor, dtype: ParamDType, *, kind: str = "scale"
-) -> torch.Tensor:
-    """Round FP32 per-group parameters to their storage dtype; return them as FP32.
-
-    Rounding is conservative so the stored range always covers the group: offsets
-    (group minima) round down and scales round up, by at most one step of the
-    storage dtype. Nothing is clipped; a coarser dtype only widens the range.
-    A zero scale (constant group) becomes 1. A value too large for the dtype raises.
-    """
-    info = torch.finfo(dtype.torch_dtype)
-    if values.abs().max() > info.max:
-        raise ValueError(
-            f"A quantization {kind} exceeds the {dtype.value} range ({info.max:g}); "
-            f"use a wider {kind}_dtype"
-        )
-    if kind == "scale":
-        values = torch.where(values == 0, torch.ones_like(values), values)
-        values = values.clamp(min=info.tiny)
-    stored = values.to(dtype.torch_dtype)
-    if kind == "scale":
-        too_far = stored.float() < values
-        direction = torch.full_like(stored, float("inf"))
-    else:
-        too_far = stored.float() > values
-        direction = torch.full_like(stored, float("-inf"))
-    stored = torch.where(too_far, torch.nextafter(stored, direction), stored)
-    return stored.float()

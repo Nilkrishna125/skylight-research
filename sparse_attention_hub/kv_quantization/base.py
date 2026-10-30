@@ -1,6 +1,6 @@
 """KV quantization coordinator and its configuration."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional, Tuple, cast
 
 import torch
@@ -55,6 +55,9 @@ class KVQuantization:
         )
         self.cache_policy = cast(
             CachePolicy, CachePolicyRegistry.create(config.cache_policy)
+        )
+        self.precision_policy.validate_quantizers(
+            config.key_quantizer, config.value_quantizer
         )
         self.cache_policy.validate_quantizers(
             config.key_quantizer, config.value_quantizer
@@ -239,22 +242,28 @@ class KVQuantization:
             region=region,
             bits=quantizer.config.bits if plan is None else plan.bits,
         )
-        encoded = quantizer.quantize(transformed, plan)
         chunk = StoredChunk(
             start, token_count, context, transform_state=saved, region=region
         )
+        if plan is not None and plan.keep_tokens is not None:
+            # Tokens the plan keeps exact: quantize stand-ins (copies of neighbouring
+            # tokens, so the kept values cannot widen any group's range) and store
+            # the originals next to the codes.
+            keep = plan.keep_tokens.to(tensor.device)
+            chunk.kept_index = keep.flatten().nonzero().flatten().to(torch.int32)
+            chunk.kept_values = tensor.detach().reshape(-1, tensor.shape[-1])[
+                chunk.kept_index.long()
+            ].clone()
+            transformed = fill_kept_tokens(transformed, keep)
+            plan = replace(plan, keep_tokens=None)
+        encoded = quantizer.quantize(transformed, plan, context=context)
         if self.config.store_codes:
             chunk.quantized = encoded
         else:
-            chunk.dequantized = (
-                transform.inverse(
-                    quantizer.dequantize(encoded),
-                    context,
-                    saved,
-                )
-                .detach()
-                .clone()
-            )
+            chunk.dequantized = restore_kept_tokens(
+                transform.inverse(quantizer.dequantize(encoded), context, saved),
+                chunk,
+            ).detach().clone()
         return chunk
 
     def _decode_chunk(self, kind: str, chunk: StoredChunk) -> torch.Tensor:
@@ -265,10 +274,13 @@ class KVQuantization:
         quantizer = self._quantizer_for(kind, chunk.region)
         transform = self.key_transform if kind == "key" else self.value_transform
         assert chunk.quantized is not None and quantizer is not None
-        return transform.inverse(
-            quantizer.dequantize(chunk.quantized),
-            chunk.context,
-            chunk.transform_state,
+        return restore_kept_tokens(
+            transform.inverse(
+                quantizer.dequantize(chunk.quantized),
+                chunk.context,
+                chunk.transform_state,
+            ),
+            chunk,
         )
 
     def _compress(
@@ -316,6 +328,33 @@ class KVQuantization:
     def calibrate(self, kv_samples: Any) -> None:
         """TODO: dispatch method-specific calibration and persist its artifacts."""
         raise NotImplementedError("Calibration recipes are scaffolded, not implemented")
+
+
+def fill_kept_tokens(x: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+    """Replace each kept token by the nearest earlier non-kept token of the same
+    head (or the next one, at the start), so it adds no new values to any group.
+    Heads whose tokens are all kept become zeros."""
+    tokens = x.shape[-2]
+    position = torch.arange(tokens, device=x.device).expand_as(keep)
+    previous = torch.where(~keep, position, -1).cummax(dim=-1).values
+    following = torch.where(~keep, position, tokens).flip(-1).cummin(dim=-1).values
+    following = following.flip(-1)
+    source = torch.where(previous >= 0, previous, following)
+    filled = x.gather(
+        -2, source.clamp(max=tokens - 1)[..., None].expand(*source.shape, x.shape[-1])
+    )
+    return torch.where((source >= tokens)[..., None], torch.zeros_like(filled), filled)
+
+
+def restore_kept_tokens(x: torch.Tensor, chunk: StoredChunk) -> torch.Tensor:
+    """Put the original values of kept tokens back into decoded ``x``."""
+    if chunk.kept_index is None or chunk.kept_values is None:
+        return x
+    restored = x.clone()
+    restored.view(-1, x.shape[-1])[chunk.kept_index.long()] = chunk.kept_values.to(
+        x.dtype
+    )
+    return restored
 
 
 class PendingRecipe(KVQuantization):

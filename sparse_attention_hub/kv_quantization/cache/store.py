@@ -182,9 +182,16 @@ class QuantizedKVStore:
     @staticmethod
     def _chunk_bytes(chunk: StoredChunk) -> int:
         for tensor in (chunk.full_precision, chunk.dequantized):
-            if tensor is not None:
+            if tensor is not None:  # already holds every token, kept ones included
                 return tensor.numel() * tensor.element_size()
-        return 0 if chunk.quantized is None else chunk.quantized.storage_bytes()
+        if chunk.quantized is None:
+            return 0
+        kept = sum(
+            t.numel() * t.element_size()
+            for t in (chunk.kept_index, chunk.kept_values)
+            if t is not None
+        )
+        return chunk.quantized.storage_bytes() + kept
 
     def stats(self) -> Dict[str, Any]:
         owned_bytes = 0
