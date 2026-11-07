@@ -28,6 +28,8 @@ from sparse_attention_hub.kv_quantization import (
     SinkOnlyCachePolicyConfig,
 )
 
+pytestmark = pytest.mark.unit
+
 HEADS = 2
 DIM = 32
 PER_TOKEN = IntQuantizerConfig(bits=2, group_size=DIM)
@@ -56,7 +58,9 @@ def step_stats(kvq: KVQuantization, tokens: int):
     k, v = history(tokens), history(tokens, seed=1)
     meta: Dict[str, Any] = {}
     for t in range(1, tokens + 1):
-        out_k, out_v = kvq.process(0, k[..., :t, :], v[..., :t, :], meta)
+        out_k, out_v = kvq.process(
+            0, k[..., :t, :], v[..., :t, :], meta, num_new_tokens=0
+        )
         yield t, (k, v, out_k, out_v), meta[CACHE_KEY].stats()["layers"][0]
 
 
@@ -85,10 +89,14 @@ class TestRegistry:
 
 class TestDefault:
     def test_tail_stays_between_window_and_window_plus_block(self):
-        kvq = coordinator(DefaultCachePolicyConfig(
-            key_local=RegionConfig(16), value_local=RegionConfig(16),
-            key_block_tokens=8, value_block_tokens=8,
-        ))
+        kvq = coordinator(
+            DefaultCachePolicyConfig(
+                key_local=RegionConfig(16),
+                value_local=RegionConfig(16),
+                key_block_tokens=8,
+                value_block_tokens=8,
+            )
+        )
         for t, _, stats in step_stats(kvq, 80):
             assert stats["key_recent_tokens"] == (t if t < 24 else 16 + (t - 16) % 8)
 
@@ -143,9 +151,12 @@ class TestSinkOnly:
             assert torch.equal(out_k[..., : min(t, 4), :], k[..., : min(t, 4), :])
 
     def test_quantized_sink(self):
-        kvq = coordinator(SinkOnlyCachePolicyConfig(
-            key_sink=RegionConfig(4, PER_TOKEN), value_sink=RegionConfig(4, PER_TOKEN)
-        ))
+        kvq = coordinator(
+            SinkOnlyCachePolicyConfig(
+                key_sink=RegionConfig(4, PER_TOKEN),
+                value_sink=RegionConfig(4, PER_TOKEN),
+            )
+        )
         *_, (_, _, stats) = step_stats(kvq, 10)
         assert stats["key_encoded_tokens"] == stats["value_encoded_tokens"] == 10
 
@@ -173,9 +184,11 @@ class TestFullQuantization:
 
 class TestLocalOnly:
     def test_window_is_exact(self):
-        kvq = coordinator(LocalOnlyCachePolicyConfig(
-            key_local=RegionConfig(16), value_local=RegionConfig(8)
-        ))
+        kvq = coordinator(
+            LocalOnlyCachePolicyConfig(
+                key_local=RegionConfig(16), value_local=RegionConfig(8)
+            )
+        )
         for t, (k, _, out_k, _), stats in step_stats(kvq, 40):
             assert stats["key_recent_tokens"] == min(t, 16)
             assert stats["value_recent_tokens"] == min(t, 8)

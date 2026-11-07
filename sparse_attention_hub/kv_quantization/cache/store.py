@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 
+from ..numerics import require_finite
 from ..policies.cache.base import CachePolicy
 from .block import StoredChunk
 from .state import LayerKVState, TensorCacheState
@@ -41,38 +42,23 @@ class QuantizedKVStore:
         values: torch.Tensor,
         encode: Encoder,
     ) -> int:
-        """Inputs are full HF history. Own only the unseen suffix.
+        """Append only new tokens, independently of HF's current cache length.
 
         The first configured tokens go to the sink (encoded now, since sinks never
         move). The rest join the local window as pending full-precision chunks;
         ``compress_ready`` moves old ones to the middle and encodes the remainder.
         """
-        if keys.ndim != 4 or values.ndim != 4 or keys.shape[:3] != values.shape[:3]:
-            raise ValueError(
-                "Expected matching [batch, kv_heads, tokens, channels] K/V"
-            )
-        if not keys.is_floating_point() or not values.is_floating_point():
-            raise ValueError("Native K/V inputs must be floating point")
-        state = self.layers.setdefault(layer_idx, LayerKVState())
-        if keys.shape[-2] < state.seen_tokens:
-            raise ValueError(
-                "KV history shrank; eviction/rollback requires a different cache policy"
-            )
-        schemas = (self._schema(keys), self._schema(values))
-        if state.key_schema is not None and schemas != (
-            state.key_schema,
-            state.value_schema,
-        ):
-            raise ValueError(
-                "Batch/head/channel shape, dtype or device changed; start a fresh store"
-            )
-        state.key_schema, state.value_schema = schemas
-        new_count = int(keys.shape[-2]) - state.seen_tokens
+        self.validate_input(layer_idx, keys, values)
+        new_count = int(keys.shape[-2])
         if new_count == 0:
             return 0
-        for kind, full in (("key", keys), ("value", values)):
+        # Check newly captured tokens even when policy keeps them uncompressed.
+        require_finite(keys, name="New keys")
+        require_finite(values, name="New values")
+        state = self.layers.setdefault(layer_idx, LayerKVState())
+        state.key_schema, state.value_schema = self._schema(keys), self._schema(values)
+        for kind, new in (("key", keys.detach()), ("value", values.detach())):
             target: TensorCacheState = getattr(state, kind)
-            new = full[..., state.seen_tokens :, :].detach()
             sink_count = min(
                 new_count, max(0, self.sink_tokens[kind] - target.sink_tokens)
             )
@@ -90,8 +76,33 @@ class QuantizedKVStore:
                         full_precision=rest.clone(),
                     )
                 )
-        state.seen_tokens = int(keys.shape[-2])
+        state.seen_tokens += new_count
         return new_count
+
+    def validate_input(
+        self, layer_idx: int, keys: torch.Tensor, values: torch.Tensor
+    ) -> None:
+        """Check shapes and the layer's schema before reading or changing state."""
+        if keys.ndim != 4 or values.ndim != 4 or keys.shape[:3] != values.shape[:3]:
+            raise ValueError(
+                "Expected matching [batch, kv_heads, tokens, channels] K/V"
+            )
+        if not keys.is_floating_point() or not values.is_floating_point():
+            raise ValueError("Native K/V inputs must be floating point")
+        state = self.layers.get(layer_idx)
+        schemas = (self._schema(keys), self._schema(values))
+        if (
+            state is not None
+            and state.key_schema is not None
+            and schemas
+            != (
+                state.key_schema,
+                state.value_schema,
+            )
+        ):
+            raise ValueError(
+                "Batch/head/channel shape, dtype or device changed; start a fresh store"
+            )
 
     def compress_ready(
         self,
@@ -160,9 +171,7 @@ class QuantizedKVStore:
             remaining = 0
         return torch.cat(taken, dim=-2)
 
-    def get(
-        self, layer_idx: int, decode: Decoder
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get(self, layer_idx: int, decode: Decoder) -> Tuple[torch.Tensor, torch.Tensor]:
         """Reconstruct temporary K/V, preserving original order and KV-head layout."""
         outputs = []
         layer = self.layers[layer_idx]
@@ -183,7 +192,7 @@ class QuantizedKVStore:
     def _chunk_bytes(chunk: StoredChunk) -> int:
         for tensor in (chunk.full_precision, chunk.dequantized):
             if tensor is not None:  # already holds every token, kept ones included
-                return tensor.numel() * tensor.element_size()
+                return int(tensor.numel() * tensor.element_size())
         if chunk.quantized is None:
             return 0
         kept = sum(
@@ -191,7 +200,7 @@ class QuantizedKVStore:
             for t in (chunk.kept_index, chunk.kept_values)
             if t is not None
         )
-        return chunk.quantized.storage_bytes() + kept
+        return int(chunk.quantized.storage_bytes() + kept)
 
     def stats(self) -> Dict[str, Any]:
         owned_bytes = 0

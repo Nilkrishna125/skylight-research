@@ -7,12 +7,13 @@ import torch
 
 from ...cache.block import QuantizedTensor
 from ...context import AttentionContext
+from ...numerics import finite_cast
 from ...policies.precision.base import PrecisionPlan
 from ...registry import KVQuantizerRegistry
 from ..base import KVQuantizer, KVQuantizerConfig, QuantGranularity
 from ..common import (
     check_input,
-    group_values,
+    group_for_quantization,
     layout_from_metadata,
     layout_metadata,
     store_param,
@@ -66,10 +67,12 @@ class FP8Quantizer(KVQuantizer):
         *,
         context: Optional[AttentionContext] = None,
     ) -> QuantizedTensor:
-        check_input(x, plan)
+        check_input(x, plan, allow_keep_tokens=True)
         if plan is not None and plan.bits != 8:
             raise ValueError("FP8 precision plan must use 8 bits")
-        groups, layout = group_values(x, self.granularity, self.config.group_size)
+        groups, layout, _ = group_for_quantization(
+            x, self.granularity, self.config.group_size, plan
+        )
         largest = torch.finfo(self.dtype).max
         amax = groups.abs().amax(dim=-1, keepdim=True)
         scale = store_param(amax / largest, self.config.scale_dtype)
@@ -92,8 +95,14 @@ class FP8Quantizer(KVQuantizer):
         if q.format_id != f"fp8_{self.config.format.lower()}_v1":
             raise ValueError(f"Unsupported FP8 encoding: {q.format_id}")
         layout = layout_from_metadata(q.metadata, q.axis)
-        values = q.codes.view(self.dtype).float().reshape(
-            *layout.layout_shape[:-1], layout.padded_length // q.group_size, q.group_size
+        values = (
+            q.codes.view(self.dtype)
+            .float()
+            .reshape(
+                *layout.layout_shape[:-1],
+                layout.padded_length // q.group_size,
+                q.group_size,
+            )
         )
         restored = ungroup_values(values * q.scales.float(), layout, q.shape)
-        return restored.to(device=q.device, dtype=q.dtype).contiguous()
+        return finite_cast(restored, q.dtype, device=q.device)

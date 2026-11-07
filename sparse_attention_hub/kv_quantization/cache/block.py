@@ -60,8 +60,9 @@ class StoredChunk:
     dequantized: Optional[torch.Tensor] = None
     region: str = "middle"
     full_precision: Optional[torch.Tensor] = None
-    # Tokens a precision plan kept in their original precision: flat indices into
-    # [batch * heads * tokens] and their values [kept, head_dim].
+    # Packed chunks only: tokens a plan keeps exact, with flat indices into
+    # [batch * heads * tokens] and values [kept, head_dim]. FAKE chunks already
+    # contain their originals in dequantized and release these extra tensors.
     kept_index: Optional[torch.Tensor] = None
     kept_values: Optional[torch.Tensor] = None
 

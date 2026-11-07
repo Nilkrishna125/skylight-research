@@ -19,7 +19,10 @@ class PrecisionPlan:
         channel_bits: Optional ``[batch, heads, head_dim]`` integer bits per channel
             (mixed precision across channels, e.g. Kitty's boosted key channels).
         keep_tokens: Optional ``[batch, heads, tokens]`` boolean mask of tokens
-            kept in their original precision instead of being quantized.
+            kept in their original precision instead of being quantized. Opt-in
+            codecs exclude them from encoding statistics; the coordinator owns
+            saving/restoring originals. This generic contract does not prescribe
+            any named paper's outlier treatment.
     """
 
     bits: int

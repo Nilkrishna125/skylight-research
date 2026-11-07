@@ -6,6 +6,7 @@ from typing import Any, Tuple
 import torch
 
 from ...context import AttentionContext
+from ...numerics import require_finite
 from ...registry import KVTransformRegistry
 from ..base import KVTransform, KVTransformConfig
 
@@ -25,4 +26,5 @@ class IdentityTransform(KVTransform):
     def inverse(
         self, x: torch.Tensor, context: AttentionContext, state: Any
     ) -> torch.Tensor:
+        require_finite(x, name="Reconstructed values")
         return x

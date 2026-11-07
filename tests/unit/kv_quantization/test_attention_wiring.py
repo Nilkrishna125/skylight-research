@@ -7,12 +7,12 @@ import torch
 
 from sparse_attention_hub.kv_quantization import (
     CACHE_KEY,
+    DefaultCachePolicyConfig,
     IntQuantizerConfig,
     KVQuantization,
     KVQuantizationConfig,
     QuantizedKVStore,
     RegionConfig,
-    DefaultCachePolicyConfig,
 )
 from sparse_attention_hub.sparse_attention.research_attention import (
     ResearchAttention,
@@ -25,6 +25,8 @@ from sparse_attention_hub.sparse_attention.research_attention.maskers.fixed.impl
 from sparse_attention_hub.sparse_attention.utils.mask_attention_utils import (
     get_true_attention_output,
 )
+
+pytestmark = pytest.mark.unit
 
 Q_LEN = 4
 K_LEN = 64
@@ -119,7 +121,9 @@ class TestOff:
     def test_quantize_kv_returns_inputs_unchanged(self):
         _, k, v = _tensors()
         meta = {}
-        out_k, out_v = _attention().quantize_kv(k, v, meta, layer_idx=0)
+        out_k, out_v = _attention().quantize_kv(
+            k, v, meta, num_new_tokens=Q_LEN, layer_idx=0
+        )
         assert out_k is k and out_v is v
         assert CACHE_KEY not in meta
 
@@ -142,7 +146,7 @@ class TestOn:
 
         # Same history through a separate coordinator gives the K̂, V̂ attention used.
         k_hat, v_hat = KVQuantization.create_from_config(_kv_config()).process(
-            0, k, v, {}
+            0, k, v, {}, num_new_tokens=0
         )
         expected, _ = _run(_attention(), q, k_hat, v_hat, {})
         assert torch.equal(out, expected)
@@ -181,9 +185,7 @@ class TestOn:
 
     def test_layer_excluded_by_gating_is_still_quantized(self):
         q, k, v = _tensors()
-        attention = _attention(
-            _kv_config(), apply_to_layer_types=("full_attention",)
-        )
+        attention = _attention(_kv_config(), apply_to_layer_types=("full_attention",))
         module = _module(0, layer_types=["sliding_attention"])
         meta = {}
         out, _ = _run(attention, q, k, v, meta, module=module)
@@ -197,7 +199,7 @@ class TestOn:
     def test_missing_layer_idx_raises(self):
         _, k, v = _tensors()
         with pytest.raises(KeyError):
-            _attention(_kv_config()).quantize_kv(k, v, {})
+            _attention(_kv_config()).quantize_kv(k, v, {}, num_new_tokens=Q_LEN)
 
 
 class TestRequestCleanup:

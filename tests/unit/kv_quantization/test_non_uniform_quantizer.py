@@ -21,11 +21,15 @@ from sparse_attention_hub.kv_quantization.quantizers.implementations.non_uniform
     lloyd_max_gaussian,
 )
 
+pytestmark = pytest.mark.unit
+
 CONTEXT = AttentionContext(0, "key", 0)
 
 
 def gaussian(tokens: int = 256, channels: int = 128, seed: int = 0) -> torch.Tensor:
-    return torch.randn(1, 2, tokens, channels, generator=torch.Generator().manual_seed(seed))
+    return torch.randn(
+        1, 2, tokens, channels, generator=torch.Generator().manual_seed(seed)
+    )
 
 
 def outlier_channels(tokens: int = 256, seed: int = 0) -> torch.Tensor:
@@ -56,7 +60,10 @@ class TestLloydMax:
 
 class TestGaussianMode:
     def test_registry_and_direct_parent(self):
-        assert type(KVQuantizerRegistry.create(NonUniformQuantizerConfig())) is NonUniformQuantizer
+        assert (
+            type(KVQuantizerRegistry.create(NonUniformQuantizerConfig()))
+            is NonUniformQuantizer
+        )
         assert NonUniformQuantizer.__bases__ == (KVQuantizer,)
 
     @pytest.mark.parametrize("bits, expected", [(1, 0.6), (2, 0.34), (4, 0.097)])
@@ -75,7 +82,10 @@ class TestGaussianMode:
 
     def test_norm_dtype_follows_scale_dtype(self):
         config = NonUniformQuantizerConfig(bits=2, scale_dtype=ParamDType.FP32)
-        assert NonUniformQuantizer(config).quantize(gaussian()).norms.dtype == torch.float32
+        assert (
+            NonUniformQuantizer(config).quantize(gaussian()).norms.dtype
+            == torch.float32
+        )
 
     def test_scale_invariant(self):
         quantizer = NonUniformQuantizer(NonUniformQuantizerConfig(bits=4))
@@ -86,7 +96,9 @@ class TestGaussianMode:
 
     def test_zero_vectors_stay_zero(self):
         x = torch.zeros(1, 1, 4, 128)
-        assert torch.equal(NonUniformQuantizer(NonUniformQuantizerConfig()).fake_quantize(x), x)
+        assert torch.equal(
+            NonUniformQuantizer(NonUniformQuantizerConfig()).fake_quantize(x), x
+        )
 
     def test_random_rotation_rescues_outlier_channels(self):
         """TurboQuant's recipe: rotate first, so coordinates look Gaussian."""
@@ -95,9 +107,11 @@ class TestGaussianMode:
         def run(transform):
             kwargs = {} if transform is None else {"key_transform": transform}
             kvq = KVQuantization.create_from_config(
-                KVQuantizationConfig(key_quantizer=NonUniformQuantizerConfig(bits=2), **kwargs)
+                KVQuantizationConfig(
+                    key_quantizer=NonUniformQuantizerConfig(bits=2), **kwargs
+                )
             )
-            return kvq.process(0, x, x, {})[0]
+            return kvq.process(0, x, x, {}, num_new_tokens=0)[0]
 
         assert rel_error(x, run(RandomRotationConfig())) < 0.5 * rel_error(x, run(None))
 
@@ -110,7 +124,9 @@ class TestGaussianMode:
 
 class TestCalibratedMode:
     def calibrated(self, bits: int = 2) -> NonUniformQuantizer:
-        quantizer = NonUniformQuantizer(NonUniformQuantizerConfig(bits=bits, mode="calibrated"))
+        quantizer = NonUniformQuantizer(
+            NonUniformQuantizerConfig(bits=bits, mode="calibrated")
+        )
         quantizer.calibrate({(0, "key"): outlier_channels(2048, seed=7)})
         return quantizer
 
@@ -157,7 +173,8 @@ class TestCalibratedMode:
         )
         x = outlier_channels()
         assert torch.equal(
-            loaded.fake_quantize(x, context=CONTEXT), quantizer.fake_quantize(x, context=CONTEXT)
+            loaded.fake_quantize(x, context=CONTEXT),
+            quantizer.fake_quantize(x, context=CONTEXT),
         )
         with pytest.raises(ValueError, match="2-bit"):
             NonUniformQuantizer(
@@ -173,20 +190,26 @@ class TestCalibratedMode:
                 KVQuantizationConfig(key_quantizer=config, store_codes=store_codes)
             )
             kvq.key_quantizer.calibrate({(0, "key"): outlier_channels(2048, seed=7)})
-            outputs.append(kvq.process(0, x, x, {})[0])
+            outputs.append(kvq.process(0, x, x, {}, num_new_tokens=0)[0])
         assert torch.equal(outputs[0], outputs[1])
 
 
 class TestSettings:
-    @pytest.mark.parametrize("kwargs, message", [({"mode": "pca"}, "mode"), ({"bits": 3}, "bits")])
+    @pytest.mark.parametrize(
+        "kwargs, message", [({"mode": "pca"}, "mode"), ({"bits": 3}, "bits")]
+    )
     def test_invalid_settings(self, kwargs, message):
         with pytest.raises(ValueError, match=message):
             NonUniformQuantizer(NonUniformQuantizerConfig(**kwargs))
 
     def test_calibrate_is_only_for_calibrated_mode(self):
         with pytest.raises(ValueError, match="calibrated"):
-            NonUniformQuantizer(NonUniformQuantizerConfig()).calibrate({(0, "key"): gaussian()})
+            NonUniformQuantizer(NonUniformQuantizerConfig()).calibrate(
+                {(0, "key"): gaussian()}
+            )
 
     def test_one_bit_works(self):
-        restored = NonUniformQuantizer(NonUniformQuantizerConfig(bits=1)).fake_quantize(gaussian())
+        restored = NonUniformQuantizer(NonUniformQuantizerConfig(bits=1)).fake_quantize(
+            gaussian()
+        )
         assert math.isfinite(restored.sum().item())

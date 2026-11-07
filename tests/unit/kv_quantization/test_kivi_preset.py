@@ -5,13 +5,15 @@ import torch
 
 from sparse_attention_hub.kv_quantization import (
     CACHE_KEY,
+    KIVI,
     FixedPrecision,
     FP8QuantizerConfig,
     IdentityTransform,
     IntQuantizerConfig,
-    KIVI,
-    KIVIConfig,
     KittyCachePolicyConfig,
+    KIVIConfig,
+    KIVIQuantizer,
+    KIVIQuantizerConfig,
     KVQuantization,
     KVQuantizationConfig,
     OutlierTokenPolicyConfig,
@@ -27,6 +29,8 @@ from sparse_attention_hub.sparse_attention.research_attention import (
     ResearchAttentionConfig,
 )
 
+pytestmark = pytest.mark.unit
+
 PER_CHANNEL = QuantGranularity.PER_CHANNEL
 
 
@@ -40,7 +44,7 @@ def history(tokens: int, seed: int = 0) -> torch.Tensor:
 def run(kvq: KVQuantization, k: torch.Tensor, v: torch.Tensor, steps):
     meta: dict = {}
     for t in steps:
-        out = kvq.process(0, k[..., :t, :], v[..., :t, :], meta)
+        out = kvq.process(0, k[..., :t, :], v[..., :t, :], meta, num_new_tokens=0)
     return out, meta
 
 
@@ -52,38 +56,54 @@ class TestConstruction:
         assert isinstance(kvq.cache_policy, SinkAndLocalCachePolicy)
         assert isinstance(kvq.precision_policy, FixedPrecision)
         assert isinstance(kvq.key_transform, IdentityTransform)
+        assert isinstance(kvq.key_quantizer, KIVIQuantizer)
 
     def test_defaults_are_kivi_2(self):
         config = KIVIConfig()
         assert (config.key_quantizer.bits, config.value_quantizer.bits) == (2, 2)
         assert QuantGranularity(config.key_quantizer.granularity) == PER_CHANNEL
-        assert QuantGranularity(config.value_quantizer.granularity) == QuantGranularity.PER_TOKEN
-        assert config.key_quantizer.group_size == config.value_quantizer.group_size == 32
-        assert not config.key_quantizer.symmetric and not config.value_quantizer.symmetric
+        assert (
+            QuantGranularity(config.value_quantizer.granularity)
+            == QuantGranularity.PER_TOKEN
+        )
+        assert (
+            config.key_quantizer.group_size == config.value_quantizer.group_size == 32
+        )
+        assert (
+            not config.key_quantizer.symmetric and not config.value_quantizer.symmetric
+        )
         assert config.key_quantizer.scale_dtype == ParamDType.FP16
-        assert config.cache_policy.key_local.tokens == config.cache_policy.value_local.tokens == 128
+        assert (
+            config.cache_policy.key_local.tokens
+            == config.cache_policy.value_local.tokens
+            == 128
+        )
         assert config.cache_policy.key_sink.tokens == 0
 
     def test_through_research_attention(self):
         attention = ResearchAttention.create_from_config(
-            ResearchAttentionConfig(masker_configs=[], kv_quantization_config=KIVIConfig())
+            ResearchAttentionConfig(
+                masker_configs=[], kv_quantization_config=KIVIConfig()
+            )
         )
         assert type(attention.kv_quantization) is KIVI
 
 
 class TestNumerics:
     def test_same_numbers_as_the_equivalent_generic_config(self):
-        """KIVI adds checks, not new maths: it equals the same parts assembled by hand."""
+        """The recipe wires the reference codec and shared buffering correctly."""
         k, v = history(300), history(300, seed=1)
         generic = KVQuantization.create_from_config(
             KVQuantizationConfig(
-                key_quantizer=IntQuantizerConfig(bits=2, granularity=PER_CHANNEL),
-                value_quantizer=IntQuantizerConfig(bits=2),
+                key_quantizer=KIVIQuantizerConfig(bits=2, granularity=PER_CHANNEL),
+                value_quantizer=KIVIQuantizerConfig(bits=2),
                 cache_policy=SinkAndLocalCachePolicyConfig(),
             )
         )
         steps = [200, *range(201, 301)]
-        (kivi_k, kivi_v), _ = run(KVQuantization.create_from_config(KIVIConfig()), k, v, steps)
+        (kivi_k, kivi_v), _ = run(
+            KVQuantization.create_from_config(KIVIConfig()), k, v, steps
+        )
         (gen_k, gen_v), _ = run(generic, k, v, steps)
         assert torch.equal(kivi_k, gen_k) and torch.equal(kivi_v, gen_v)
 
@@ -92,21 +112,25 @@ class TestNumerics:
         kvq = KVQuantization.create_from_config(KIVIConfig())
         meta: dict = {}
         for t in range(1, 301):
-            kvq.process(0, k[..., :t, :], v[..., :t, :], meta)
+            kvq.process(0, k[..., :t, :], v[..., :t, :], meta, num_new_tokens=0)
             stats = meta[CACHE_KEY].stats()["layers"][0]
             assert stats["key_recent_tokens"] == t % 128
             assert stats["value_recent_tokens"] == min(t, 128)
 
     def test_full_precision_tails_are_exact(self):
         k, v = history(300), history(300, seed=1)
-        (out_k, out_v), _ = run(KVQuantization.create_from_config(KIVIConfig()), k, v, [300])
+        (out_k, out_v), _ = run(
+            KVQuantization.create_from_config(KIVIConfig()), k, v, [300]
+        )
         assert torch.equal(out_k[..., 256:, :], k[..., 256:, :])  # 300 % 128 = 44 keys
         assert torch.equal(out_v[..., -128:, :], v[..., -128:, :])
         assert not torch.equal(out_k[..., :256, :], k[..., :256, :])
 
     def test_fake_equals_packed_and_packed_is_small(self):
         k, v = history(512), history(512, seed=1)
-        fake, fake_meta = run(KVQuantization.create_from_config(KIVIConfig()), k, v, [512])
+        fake, fake_meta = run(
+            KVQuantization.create_from_config(KIVIConfig()), k, v, [512]
+        )
         packed, packed_meta = run(
             KVQuantization.create_from_config(KIVIConfig(store_codes=True)), k, v, [512]
         )
@@ -118,7 +142,9 @@ class TestNumerics:
     def test_per_channel_keys_beat_per_token_on_outlier_channels(self):
         """KIVI's reason for per-channel keys."""
         k, v = history(512), history(512, seed=1)
-        (kivi_k, _), _ = run(KVQuantization.create_from_config(KIVIConfig()), k, v, [512])
+        (kivi_k, _), _ = run(
+            KVQuantization.create_from_config(KIVIConfig()), k, v, [512]
+        )
         per_token = KIVIConfig(
             key_quantizer=IntQuantizerConfig(bits=2),
             cache_policy=SinkAndLocalCachePolicyConfig(),
@@ -183,11 +209,16 @@ class TestValidation:
             ({"key_quantizer": FP8QuantizerConfig()}, "integer"),
             (
                 {
-                    "value_quantizer": IntQuantizerConfig(bits=2, granularity=PER_CHANNEL),
+                    "value_quantizer": IntQuantizerConfig(
+                        bits=2, granularity=PER_CHANNEL
+                    ),
                 },
                 "values per token",
             ),
-            ({"cache_policy": KittyCachePolicyConfig()}, "SinkAndLocalCachePolicyConfig"),
+            (
+                {"cache_policy": KittyCachePolicyConfig()},
+                "SinkAndLocalCachePolicyConfig",
+            ),
         ],
     )
     def test_rejects_non_kivi_structure(self, kwargs, message):
@@ -199,6 +230,11 @@ class TestValidation:
             KVQuantization.create_from_config(
                 KIVIConfig.with_settings(group_size=48, residual_length=128)
             )
-        assert type(
-            KVQuantization.create_from_config(KIVIConfig.with_settings(group_size=64))
-        ) is KIVI
+        assert (
+            type(
+                KVQuantization.create_from_config(
+                    KIVIConfig.with_settings(group_size=64)
+                )
+            )
+            is KIVI
+        )

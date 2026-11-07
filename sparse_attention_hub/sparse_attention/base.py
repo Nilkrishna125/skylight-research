@@ -52,18 +52,21 @@ class SparseAttention(ABC):
         keys: torch.Tensor,
         values: torch.Tensor,
         sparse_meta_data: Dict[Any, Any],
+        *,
+        num_new_tokens: int,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the keys and values attention should use.
 
         Without KV quantization this returns the inputs unchanged. Otherwise the
-        full-precision history from the HF cache is copied into the request's
-        quantized store, and the reconstructed keys and values are returned.
+        previous stored history is reconstructed and combined with this call's
+        original new K/V before the persistent store is updated/compressed.
 
         Args:
             keys: Full key history from the HF cache, (b, h_kv, s, d).
             values: Full value history from the HF cache, (b, h_kv, s, d).
             sparse_meta_data: Per-request metadata that holds the quantized store.
+            num_new_tokens: Query sequence length for this self-attention call.
             **kwargs: Attention kwargs; must include ``layer_idx``.
 
         Returns:
@@ -76,6 +79,8 @@ class SparseAttention(ABC):
             keys,
             values,
             sparse_meta_data,
+            num_new_tokens=num_new_tokens,
+            phase=sparse_meta_data.get("kv_quantization_phase", "decode"),
             position_ids=kwargs.get("position_ids"),
         )
 

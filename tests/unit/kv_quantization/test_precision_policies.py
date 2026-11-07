@@ -25,7 +25,8 @@ from sparse_attention_hub.kv_quantization import (
     QuantGranularity,
     RegionConfig,
 )
-from sparse_attention_hub.kv_quantization.base import fill_kept_tokens
+
+pytestmark = pytest.mark.unit
 
 PER_CHANNEL_INT2 = IntQuantizerConfig(
     bits=2, granularity=QuantGranularity.PER_CHANNEL, group_size=32
@@ -51,7 +52,9 @@ def all_middle(**overrides) -> DefaultCachePolicyConfig:
     )
 
 
-def coordinator(policy, key_quantizer=PER_CHANNEL_INT2, value_quantizer=PER_TOKEN_INT2, **kw):
+def coordinator(
+    policy, key_quantizer=PER_CHANNEL_INT2, value_quantizer=PER_TOKEN_INT2, **kw
+):
     return KVQuantization.create_from_config(
         KVQuantizationConfig(
             key_quantizer=key_quantizer,
@@ -91,7 +94,9 @@ class TestMixedBitInt:
             quantizer.quantize(x, PrecisionPlan(bits=2, channel_bits=channel_bits))
         )
         int4 = IntQuantizer(
-            IntQuantizerConfig(bits=4, granularity=QuantGranularity.PER_CHANNEL, group_size=32)
+            IntQuantizerConfig(
+                bits=4, granularity=QuantGranularity.PER_CHANNEL, group_size=32
+            )
         ).fake_quantize(x)
         int2 = quantizer.fake_quantize(x)
         assert torch.equal(restored[..., :8], int4[..., :8])
@@ -114,7 +119,9 @@ class TestMixedBitInt:
         channel_bits[0, 0, 0] = 8
         channel_bits[0, 1, 5] = 4
         quantizer = IntQuantizer(PER_CHANNEL_INT2)
-        restored = quantizer.fake_quantize(x, PrecisionPlan(bits=2, channel_bits=channel_bits))
+        restored = quantizer.fake_quantize(
+            x, PrecisionPlan(bits=2, channel_bits=channel_bits)
+        )
         assert restored.shape == x.shape
 
     def test_needs_per_channel_granularity(self):
@@ -137,27 +144,39 @@ class TestChannelBoost:
     def test_boosts_the_largest_channels_of_keys_only(self):
         policy = ChannelBoost(ChannelBoostConfig(fraction=3 / 64, boosted_bits=4))
         x = keys()
-        plan = policy.bits_for(0, x, torch.arange(128), tensor_kind="key", default_bits=2)
+        plan = policy.bits_for(
+            0, x, torch.arange(128), tensor_kind="key", default_bits=2
+        )
         boosted = (plan.channel_bits == 4).nonzero()[:, -1].reshape(2, 3).sort().values
         assert boosted.tolist() == [[3, 17, 40], [3, 17, 40]]
-        value_plan = policy.bits_for(0, x, torch.arange(128), tensor_kind="value", default_bits=2)
+        value_plan = policy.bits_for(
+            0, x, torch.arange(128), tensor_kind="value", default_bits=2
+        )
         assert value_plan.channel_bits is None
 
     def test_fraction_rounds_to_a_channel_count(self):
         policy = ChannelBoost(ChannelBoostConfig(fraction=0.125))
-        plan = policy.bits_for(0, keys(), torch.arange(128), tensor_kind="key", default_bits=2)
+        plan = policy.bits_for(
+            0, keys(), torch.arange(128), tensor_kind="key", default_bits=2
+        )
         assert (plan.channel_bits == 4).sum(dim=-1).tolist() == [[8, 8]]
 
     def test_lowers_error_inside_kv_quantization(self):
         x, v = keys(), keys(seed=1)
-        fixed, _ = coordinator(FixedPrecisionConfig()).process(0, x, v, {})
-        boosted, _ = coordinator(ChannelBoostConfig()).process(0, x, v, {})
+        fixed, _ = coordinator(FixedPrecisionConfig()).process(
+            0, x, v, {}, num_new_tokens=0
+        )
+        boosted, _ = coordinator(ChannelBoostConfig()).process(
+            0, x, v, {}, num_new_tokens=0
+        )
         assert rel_error(x, boosted) < 0.8 * rel_error(x, fixed)
 
     def test_fake_equals_packed(self):
         x, v = keys(), keys(seed=1)
-        fake = coordinator(ChannelBoostConfig()).process(0, x, v, {})
-        packed = coordinator(ChannelBoostConfig(), store_codes=True).process(0, x, v, {})
+        fake = coordinator(ChannelBoostConfig()).process(0, x, v, {}, num_new_tokens=0)
+        packed = coordinator(ChannelBoostConfig(), store_codes=True).process(
+            0, x, v, {}, num_new_tokens=0
+        )
         assert torch.equal(fake[0], packed[0]) and torch.equal(fake[1], packed[1])
 
     def test_rejects_quantizers_that_cannot_mix_bits(self):
@@ -185,20 +204,30 @@ class TestOutlierTokenPolicy:
     def test_flags_only_the_huge_tokens(self):
         policy = OutlierTokenPolicy(OutlierTokenPolicyConfig())
         plan = policy.bits_for(
-            0, with_outlier_tokens(), torch.arange(128), tensor_kind="key", default_bits=2
+            0,
+            with_outlier_tokens(),
+            torch.arange(128),
+            tensor_kind="key",
+            default_bits=2,
         )
         assert plan.keep_tokens[0, 0].nonzero().flatten().tolist() == [10, 70]
         assert plan.keep_tokens[0, 1].nonzero().flatten().tolist() == [99]
 
     def test_no_outliers_means_a_plain_plan(self):
         policy = OutlierTokenPolicy(OutlierTokenPolicyConfig())
-        plan = policy.bits_for(0, keys(), torch.arange(128), tensor_kind="key", default_bits=2)
+        plan = policy.bits_for(
+            0, keys(), torch.arange(128), tensor_kind="key", default_bits=2
+        )
         assert plan.keep_tokens is None
 
     def test_max_fraction_caps_the_kept_tokens(self):
         policy = OutlierTokenPolicy(OutlierTokenPolicyConfig(max_fraction=1 / 128))
         plan = policy.bits_for(
-            0, with_outlier_tokens(), torch.arange(128), tensor_kind="key", default_bits=2
+            0,
+            with_outlier_tokens(),
+            torch.arange(128),
+            tensor_kind="key",
+            default_bits=2,
         )
         assert plan.keep_tokens.sum(dim=-1).tolist() == [[1, 1]]
 
@@ -206,8 +235,12 @@ class TestOutlierTokenPolicy:
         x, v = with_outlier_tokens(), keys(seed=1)
         policy = OutlierTokenPolicyConfig(kinds=("key",))
         quantizer = IntQuantizerConfig(bits=2, group_size=32)
-        out, _ = coordinator(policy, key_quantizer=quantizer).process(0, x, v, {})
-        plain, _ = coordinator(FixedPrecisionConfig(), key_quantizer=quantizer).process(0, x, v, {})
+        out, _ = coordinator(policy, key_quantizer=quantizer).process(
+            0, x, v, {}, num_new_tokens=0
+        )
+        plain, _ = coordinator(FixedPrecisionConfig(), key_quantizer=quantizer).process(
+            0, x, v, {}, num_new_tokens=0
+        )
         assert torch.equal(out[0, 0, [10, 70]], x[0, 0, [10, 70]])
         assert torch.equal(out[0, 1, 99], x[0, 1, 99])
         assert rel_error(x, out) < 0.5 * rel_error(x, plain)
@@ -215,8 +248,12 @@ class TestOutlierTokenPolicy:
     def test_kept_tokens_do_not_widen_per_channel_groups(self):
         """With per-channel groups, a kept token must not set its group's range."""
         x, v = with_outlier_tokens(), keys(seed=1)
-        out, _ = coordinator(OutlierTokenPolicyConfig(kinds=("key",))).process(0, x, v, {})
-        plain, _ = coordinator(FixedPrecisionConfig()).process(0, x, v, {})
+        out, _ = coordinator(OutlierTokenPolicyConfig(kinds=("key",))).process(
+            0, x, v, {}, num_new_tokens=0
+        )
+        plain, _ = coordinator(FixedPrecisionConfig()).process(
+            0, x, v, {}, num_new_tokens=0
+        )
         others = torch.ones(128, dtype=torch.bool)
         others[[10, 70, 99]] = False
         assert rel_error(x[..., others, :], out[..., others, :]) < 0.5 * rel_error(
@@ -224,36 +261,38 @@ class TestOutlierTokenPolicy:
         )
 
     @pytest.mark.parametrize(
-        "quantizer", [PER_CHANNEL_INT2, FP8QuantizerConfig(), FakeNVFP4QuantizerConfig()]
+        "quantizer",
+        [PER_CHANNEL_INT2, FP8QuantizerConfig(), FakeNVFP4QuantizerConfig()],
     )
     def test_fake_equals_packed_and_storage_counts_kept_tokens(self, quantizer):
         x, v = with_outlier_tokens(), keys(seed=1)
         policy = OutlierTokenPolicyConfig(kinds=("key",))
-        fake = coordinator(policy, key_quantizer=quantizer).process(0, x, v, {})
+        fake = coordinator(policy, key_quantizer=quantizer).process(
+            0, x, v, {}, num_new_tokens=0
+        )
         meta: dict = {}
         packed = coordinator(policy, key_quantizer=quantizer, store_codes=True).process(
-            0, x, v, meta
+            0, x, v, meta, num_new_tokens=0
         )
         assert torch.equal(fake[0], packed[0])
         chunks = meta[CACHE_KEY].layers[0].key.chunks
-        kept = sum(0 if c.kept_values is None else c.kept_values.shape[0] for c in chunks)
+        kept = sum(
+            0 if c.kept_values is None else c.kept_values.shape[0] for c in chunks
+        )
         assert kept == 3  # tokens 10 and 70 of head 0, token 99 of head 1
         kept_bytes = sum(
-            c.kept_values.numel() * c.kept_values.element_size() + c.kept_index.numel() * 4
+            c.kept_values.numel() * c.kept_values.element_size()
+            + c.kept_index.numel() * 4
             for c in chunks
             if c.kept_values is not None
         )
         quantized_bytes = sum(c.quantized.storage_bytes() for c in chunks)
         stored = meta[CACHE_KEY].layers[0].value.chunks
         value_bytes = sum(c.quantized.storage_bytes() for c in stored)
-        assert meta[CACHE_KEY].stats()["store_bytes"] == quantized_bytes + kept_bytes + value_bytes
-
-    def test_fill_uses_neighbouring_tokens(self):
-        x = torch.arange(6.0).reshape(1, 1, 6, 1)
-        keep = torch.tensor([[[True, False, True, True, False, True]]])
-        assert fill_kept_tokens(x, keep).flatten().tolist() == [1.0, 1.0, 1.0, 1.0, 4.0, 4.0]
-        everything = torch.ones(1, 1, 6, dtype=torch.bool)
-        assert fill_kept_tokens(x, everything).abs().sum() == 0
+        assert (
+            meta[CACHE_KEY].stats()["store_bytes"]
+            == quantized_bytes + kept_bytes + value_bytes
+        )
 
     @pytest.mark.parametrize(
         "kwargs", [{"threshold": 0.0}, {"max_fraction": 1.5}, {"kinds": ("query",)}]
@@ -262,8 +301,11 @@ class TestOutlierTokenPolicy:
         with pytest.raises(ValueError):
             OutlierTokenPolicy(OutlierTokenPolicyConfig(**kwargs))
 
-    def test_quantizers_refuse_keep_tokens_directly(self):
-        with pytest.raises(ValueError, match="KVQuantization"):
-            IntQuantizer(PER_TOKEN_INT2).quantize(
-                keys(), PrecisionPlan(bits=2, keep_tokens=torch.zeros(1, 2, 128, dtype=torch.bool))
-            )
+    def test_empty_keep_mask_preserves_quantized_values(self):
+        quantizer = IntQuantizer(PER_TOKEN_INT2)
+        x = keys()
+        with_mask = quantizer.fake_quantize(
+            x,
+            PrecisionPlan(bits=2, keep_tokens=torch.zeros(1, 2, 128, dtype=torch.bool)),
+        )
+        assert torch.equal(with_mask, quantizer.fake_quantize(x))

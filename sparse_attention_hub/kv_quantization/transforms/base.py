@@ -29,7 +29,7 @@ class KVTransform(ABC):
     def inverse(
         self, x: torch.Tensor, context: AttentionContext, state: Any
     ) -> torch.Tensor:
-        """Restore the original coordinate system."""
+        """Restore coordinates, rejecting nonfinite values and saturating dtype overflow."""
 
     def calibrate(self, samples: Any) -> None:
         raise NotImplementedError(

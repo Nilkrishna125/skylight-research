@@ -7,12 +7,14 @@ import torch
 
 from ...cache.block import QuantizedTensor
 from ...context import AttentionContext
+from ...numerics import finite_cast
 from ...policies.precision.base import PrecisionPlan
 from ...registry import KVQuantizerRegistry
 from ..base import KVQuantizer, KVQuantizerConfig, QuantGranularity
 from ..common import (
     check_input,
-    group_values,
+    group_for_quantization,
+    group_min_max,
     layout_from_metadata,
     layout_metadata,
     pack_codes,
@@ -56,15 +58,16 @@ class IntQuantizer(KVQuantizer):
         *,
         context: Optional[AttentionContext] = None,
     ) -> QuantizedTensor:
-        check_input(x, plan, allow_channel_bits=True)
+        check_input(x, plan, allow_channel_bits=True, allow_keep_tokens=True)
         bits = self.config.bits if plan is None else plan.bits
         if bits not in (2, 4, 8):
             raise ValueError("INT precision plan must use 2, 4 or 8 bits")
         if plan is not None and plan.channel_bits is not None:
-            return self._quantize_mixed(x, plan.channel_bits, bits)
-        groups, layout = group_values(x, self.granularity, self.config.group_size)
-        lo = groups.amin(dim=-1, keepdim=True)
-        hi = groups.amax(dim=-1, keepdim=True)
+            return self._quantize_mixed(x, plan.channel_bits, bits, plan)
+        groups, layout, valid = group_for_quantization(
+            x, self.granularity, self.config.group_size, plan
+        )
+        lo, hi = group_min_max(groups, valid)
 
         # Statistics are FP32. Offsets and scales are rounded to their storage
         # dtypes *before* computing codes, so decoding uses exactly what is stored.
@@ -79,7 +82,9 @@ class IntQuantizer(KVQuantizer):
             codes = (groups / scale).round().clamp(-qmax, qmax) + qmax
         else:
             offset = store_param(lo, self.config.offset_dtype, kind="offset")
-            scale = store_param((hi - offset) / (2**bits - 1), self.config.scale_dtype)
+            scale = store_param(
+                (hi - offset) / (2**bits - 1), self.config.scale_dtype
+            )
             # A constant group decodes to its offset (exact when the offset dtype
             # represents the value).
             codes = ((groups - offset) / scale).round().clamp(0, 2**bits - 1)
@@ -108,7 +113,11 @@ class IntQuantizer(KVQuantizer):
         )
 
     def _quantize_mixed(
-        self, x: torch.Tensor, channel_bits: torch.Tensor, default_bits: int
+        self,
+        x: torch.Tensor,
+        channel_bits: torch.Tensor,
+        default_bits: int,
+        plan: PrecisionPlan,
     ) -> QuantizedTensor:
         """Per-channel bit widths: every PER_CHANNEL group has its channel's width."""
         if self.granularity != QuantGranularity.PER_CHANNEL:
@@ -121,12 +130,13 @@ class IntQuantizer(KVQuantizer):
         widths = sorted(int(w) for w in channel_bits.unique())
         if any(w not in (2, 4, 8) for w in widths):
             raise ValueError("Per-channel bits must be 2, 4 or 8")
-        groups, layout = group_values(x, self.granularity, self.config.group_size)
+        groups, layout, valid = group_for_quantization(
+            x, self.granularity, self.config.group_size, plan
+        )
         # groups: [batch, heads, channels, n_groups, size]; one width per channel.
         group_bits = channel_bits.to(groups.device)[..., None].expand(groups.shape[:-1])
         bits = group_bits[..., None].float()
-        lo = groups.amin(dim=-1, keepdim=True)
-        hi = groups.amax(dim=-1, keepdim=True)
+        lo, hi = group_min_max(groups, valid)
         offset: Optional[torch.Tensor]
         if self.config.symmetric:
             qmax = 2 ** (bits - 1) - 1
@@ -140,7 +150,9 @@ class IntQuantizer(KVQuantizer):
             levels = 2**bits - 1
             offset = store_param(lo, self.config.offset_dtype, kind="offset")
             scale = store_param((hi - offset) / levels, self.config.scale_dtype)
-            codes = torch.minimum(((groups - offset) / scale).round().clamp(min=0), levels)
+            codes = torch.minimum(
+                ((groups - offset) / scale).round().clamp(min=0), levels
+            )
 
         flat_bits = group_bits.flatten()
         flat_codes = codes.reshape(-1, groups.shape[-1])
@@ -203,7 +215,9 @@ class IntQuantizer(KVQuantizer):
             flat = unpack_codes(q.codes, q.bits, q.metadata["code_count"]).float()
             group_bits = None
         groups = flat.reshape(
-            *layout.layout_shape[:-1], layout.padded_length // q.group_size, q.group_size
+            *layout.layout_shape[:-1],
+            layout.padded_length // q.group_size,
+            q.group_size,
         )
         scales = q.scales.float()
         if q.metadata["symmetric"]:
@@ -213,4 +227,4 @@ class IntQuantizer(KVQuantizer):
             assert q.zero_points is not None
             restored = groups * scales + q.zero_points.float()
         restored = ungroup_values(restored, layout, q.shape)
-        return restored.to(device=q.device, dtype=q.dtype).contiguous()
+        return finite_cast(restored, q.dtype, device=q.device)

@@ -5,9 +5,7 @@ from dataclasses import dataclass, field
 from ..base import KVQuantizationConfig, PendingRecipe
 from ..quantizers.implementations.integer import IntQuantizerConfig
 from ..registry import KVQuantizationRegistry
-from ..transforms.implementations.random_hadamard import (
-    RandomHadamardTransformConfig,
-)
+from ..transforms.implementations.random_hadamard import RandomHadamardTransformConfig
 
 
 @dataclass(frozen=True)

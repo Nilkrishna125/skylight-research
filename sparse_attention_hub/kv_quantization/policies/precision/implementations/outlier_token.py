@@ -15,7 +15,9 @@ KINDS = ("key", "value")
 class OutlierTokenPolicyConfig(PrecisionPolicyConfig):
     """A token is an outlier when its largest |value| exceeds ``threshold`` times the
     median of that statistic over the chunk (per head). Outliers stay in full
-    precision; every other token uses the quantizer's bits.
+    precision and are excluded from the codec's encoding statistics; every other
+    token uses the quantizer's bits. This is an optional generic experiment, not
+    an outlier rule automatically applied to named paper implementations.
 
     Attributes:
         threshold: How many times the median a token must exceed.

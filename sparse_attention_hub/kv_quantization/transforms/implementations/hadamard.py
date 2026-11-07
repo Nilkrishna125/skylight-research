@@ -6,6 +6,7 @@ from typing import Any, Dict, Tuple
 import torch
 
 from ...context import AttentionContext
+from ...numerics import finite_cast
 from ...registry import KVTransformRegistry
 from ..base import KVTransform, KVTransformConfig, apply_rotation
 
@@ -52,4 +53,4 @@ class HadamardTransform(KVTransform):
     def inverse(
         self, x: torch.Tensor, context: AttentionContext, state: Any
     ) -> torch.Tensor:
-        return apply_rotation(x, self.matrix(x.shape[-1]).T).to(state)
+        return finite_cast(apply_rotation(x, self.matrix(x.shape[-1]).T), state)

@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from ..numerics import require_finite
 from ..policies.precision.base import PrecisionPlan
 from .base import ParamDType, QuantGranularity
 
@@ -14,11 +15,12 @@ def check_input(
     plan: Optional[PrecisionPlan],
     *,
     allow_channel_bits: bool = False,
+    allow_keep_tokens: bool = False,
 ) -> None:
     """Reject inputs a quantizer refuses: wrong rank, non-float, NaN, unsupported plans.
 
-    Tokens a plan keeps in full precision are handled by ``KVQuantization`` before
-    quantizing, so a quantizer never receives ``keep_tokens``.
+    The coordinator saves/restores kept originals. A codec must explicitly opt
+    into excluding those positions from its own encoding statistics.
     """
     if x.ndim != 4 or not x.is_floating_point() or x.numel() == 0:
         raise ValueError(
@@ -27,7 +29,15 @@ def check_input(
     if not torch.isfinite(x).all():
         raise ValueError("Cannot quantize NaN or infinity")
     if plan is not None and plan.keep_tokens is not None:
-        raise ValueError("keep_tokens is applied by KVQuantization, not the quantizer")
+        if not allow_keep_tokens:
+            raise NotImplementedError("This quantizer does not support keep_tokens")
+        keep = plan.keep_tokens
+        if keep.dtype != torch.bool or tuple(keep.shape) != tuple(x.shape[:3]):
+            raise ValueError(
+                "keep_tokens must be boolean with shape [batch, heads, tokens]"
+            )
+        if keep.device != x.device:
+            raise ValueError("keep_tokens must be on the input device")
     if plan is not None and plan.channel_bits is not None and not allow_channel_bits:
         raise NotImplementedError(
             "This quantizer does not support per-channel bits (ChannelBoost); "
@@ -46,13 +56,18 @@ class GroupLayout:
 
 
 def group_values(
-    x: torch.Tensor, granularity: QuantGranularity, group_size: int
+    x: torch.Tensor,
+    granularity: QuantGranularity,
+    group_size: int,
+    *,
+    pad_value: Optional[float] = None,
 ) -> Tuple[torch.Tensor, GroupLayout]:
     """Split ``x`` into FP32 groups of ``group_size`` values: ``[..., groups, size]``.
 
     PER_TOKEN groups channels, PER_CHANNEL groups tokens, and PER_BLOCK groups
     consecutive channels of one token (``group_size`` must divide head_dim). An
     incomplete last group repeats its last value, so it cannot change min/max/amax.
+    ``pad_value`` instead fills padding explicitly (zero for a validity mask).
     """
     if granularity == QuantGranularity.PER_BLOCK and x.shape[-1] % group_size:
         raise ValueError(
@@ -67,10 +82,49 @@ def group_values(
     layout_shape = tuple(data.shape)
     padding = (-data.shape[-1]) % group_size
     if padding:
-        data = torch.cat([data, data[..., -1:].expand(*data.shape[:-1], padding)], -1)
+        extra = (
+            data[..., -1:].expand(*data.shape[:-1], padding)
+            if pad_value is None
+            else data.new_full((*data.shape[:-1], padding), pad_value)
+        )
+        data = torch.cat([data, extra], -1)
     padded_length = data.shape[-1]
     groups = data.reshape(*data.shape[:-1], padded_length // group_size, group_size)
     return groups, GroupLayout(granularity, axis, layout_shape, padded_length)
+
+
+def group_for_quantization(
+    x: torch.Tensor,
+    granularity: QuantGranularity,
+    group_size: int,
+    plan: Optional[PrecisionPlan],
+) -> Tuple[torch.Tensor, GroupLayout, Optional[torch.Tensor]]:
+    """Group data and optional validity identically, without moving token slots.
+
+    Kept/padded slots become safe zero placeholders for encoding, with False in
+    the validity mask. Min/max reductions must use that mask; absolute maxima
+    can reduce the zeroed data directly. With no keep mask the old path is exact.
+    """
+    groups, layout = group_values(x, granularity, group_size)
+    if plan is None or plan.keep_tokens is None:
+        return groups, layout, None
+    valid = (~plan.keep_tokens)[..., None].expand_as(x)
+    grouped_valid, _ = group_values(valid, granularity, group_size, pad_value=0.0)
+    mask = grouped_valid.bool()
+    return groups.masked_fill(~mask, 0.0), layout, mask
+
+
+def group_min_max(
+    groups: torch.Tensor, valid: Optional[torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Exclude kept/padded entries; an all-kept group has dummy range [0, 0]."""
+    if valid is None:
+        return groups.amin(dim=-1, keepdim=True), groups.amax(dim=-1, keepdim=True)
+    has_values = valid.any(dim=-1, keepdim=True)
+    low = groups.masked_fill(~valid, float("inf")).amin(dim=-1, keepdim=True)
+    high = groups.masked_fill(~valid, float("-inf")).amax(dim=-1, keepdim=True)
+    zero = torch.zeros_like(low)
+    return torch.where(has_values, low, zero), torch.where(has_values, high, zero)
 
 
 def ungroup_values(
@@ -134,6 +188,7 @@ def store_param(
     storage dtype. Nothing is clipped; a coarser dtype only widens the range.
     A zero scale (constant group) becomes 1. A value too large for the dtype raises.
     """
+    require_finite(values, name=f"Quantization {kind}")
     info = torch.finfo(dtype.torch_dtype)
     if values.abs().max() > info.max:
         raise ValueError(

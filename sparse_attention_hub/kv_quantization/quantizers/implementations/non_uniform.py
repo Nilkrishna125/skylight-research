@@ -1,14 +1,18 @@
 """NonUniformQuantizer: values snap to a table of levels instead of an even grid."""
 
+import hashlib
 import math
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Dict, Mapping, Optional, Tuple
+from threading import RLock
+from types import MappingProxyType
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 
 from ...cache.block import QuantizedTensor
 from ...context import AttentionContext
+from ...numerics import finite_cast
 from ...policies.precision.base import PrecisionPlan
 from ...registry import KVQuantizerRegistry
 from ..base import KVQuantizer, KVQuantizerConfig, QuantGranularity
@@ -35,6 +39,10 @@ class NonUniformQuantizerConfig(KVQuantizerConfig):
 
     ``bits`` must be 1, 2, 4 or 8. ``group_size``, ``symmetric`` and
     ``offset_dtype`` are unused. ``"gaussian"`` needs PER_TOKEN granularity.
+    Prepare all calibrated tables before encoding. The first successful encode
+    freezes them for that quantizer's lifetime, including FAKE encoding. Use a
+    fresh quantizer/cache to change tables; ``tables`` exposes inspection copies.
+    Successfully decoding a matching calibrated record freezes the receiver too.
     """
 
     bits: int = 2
@@ -82,16 +90,47 @@ class NonUniformQuantizer(KVQuantizer):
         super().__init__(config)
         if config.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
-        if config.bits not in (1, 2, 4, 8):
+        if type(config.bits) is not int or config.bits not in (1, 2, 4, 8):
             raise ValueError("NonUniformQuantizer supports 1, 2, 4 or 8 bits")
+        if type(config.calibration_iters) is not int or config.calibration_iters < 1:
+            raise ValueError("calibration_iters must be a positive integer")
         if (
             config.mode == "gaussian"
             and QuantGranularity(config.granularity) != QuantGranularity.PER_TOKEN
         ):
             raise ValueError("gaussian mode normalises whole tokens; use PER_TOKEN")
-        self.tables: Dict[TableKey, torch.Tensor] = {}
+        self._tables: Dict[TableKey, torch.Tensor] = {}
+        self._table_fingerprints: Dict[TableKey, str] = {}
+        self._tables_frozen = False
+        self._tables_lock = RLock()
         if config.codebook_path is not None:
             self.load(config.codebook_path)
+
+    @property
+    def tables(self) -> Mapping[TableKey, torch.Tensor]:
+        """Read-only inspection snapshot; tensor edits cannot change live tables."""
+        with self._tables_lock:
+            return MappingProxyType(
+                {key: table.clone() for key, table in self._tables.items()}
+            )
+
+    @property
+    def tables_frozen(self) -> bool:
+        """Whether calibrated tables have been used for encoding or decoding."""
+        return self._tables_frozen
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Preserve table/freeze state when sending a codec to a worker."""
+        with self._tables_lock:
+            state = self.__dict__.copy()
+            state.pop("_tables_lock")
+            state["_tables"] = self._tables.copy()
+            state["_table_fingerprints"] = self._table_fingerprints.copy()
+            return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._tables_lock = RLock()
 
     # ------------------------------------------------------------------ encoding
     def quantize(
@@ -101,12 +140,19 @@ class NonUniformQuantizer(KVQuantizer):
         *,
         context: Optional[AttentionContext] = None,
     ) -> QuantizedTensor:
-        check_input(x, plan)
+        check_input(x, plan, allow_keep_tokens=True)
         if plan is not None and plan.bits != self.config.bits:
-            raise ValueError(f"NonUniform precision plan must use {self.config.bits} bits")
+            raise ValueError(
+                f"NonUniform precision plan must use {self.config.bits} bits"
+            )
+        if plan is not None and plan.keep_tokens is not None:
+            # Whole kept vectors do not need norms or codes derived from their
+            # original magnitude. Their exact originals belong to the coordinator.
+            x = x.masked_fill(plan.keep_tokens[..., None], 0.0)
         if self.config.mode == "gaussian":
             return self._quantize_gaussian(x)
-        return self._quantize_calibrated(x, context)
+        with self._tables_lock:
+            return self._quantize_calibrated(x, context)
 
     def _quantize_gaussian(self, x: torch.Tensor) -> QuantizedTensor:
         dim = x.shape[-1]
@@ -114,9 +160,15 @@ class NonUniformQuantizer(KVQuantizer):
         exact = data.norm(dim=-1, keepdim=True)
         # Rounded up to the storage dtype; a zero vector keeps a zero norm.
         norms = torch.where(
-            exact > 0, store_param(exact, self.config.scale_dtype), torch.zeros_like(exact)
+            exact > 0,
+            store_param(exact, self.config.scale_dtype),
+            torch.zeros_like(exact),
         )
-        unit = data / torch.where(norms > 0, norms, torch.ones_like(norms)) * math.sqrt(dim)
+        unit = (
+            data
+            / torch.where(norms > 0, norms, torch.ones_like(norms))
+            * math.sqrt(dim)
+        )
         levels = lloyd_max_gaussian(self.config.bits).to(x.device)
         packed, count = pack_codes(nearest_level(unit, levels), self.config.bits)
         return self._record(x, packed, count, norms, mode="gaussian", key=None)
@@ -125,19 +177,26 @@ class NonUniformQuantizer(KVQuantizer):
         self, x: torch.Tensor, context: Optional[AttentionContext]
     ) -> QuantizedTensor:
         if context is None:
-            raise ValueError("calibrated mode needs the attention context (layer, kind)")
+            raise ValueError(
+                "calibrated mode needs the attention context (layer, kind)"
+            )
         key = (context.layer_idx, context.tensor_kind)
-        if key not in self.tables:
+        key = self._validate_table_key(key)
+        if key not in self._tables:
             raise RuntimeError(
                 f"NonUniformQuantizer has no table for layer {key[0]} {key[1]}s; "
-                "run calibrate() or set codebook_path"
+                "run calibrate() or set codebook_path for all needed layers/kinds "
+                "before encoding"
             )
-        table = self.tables[key].to(x.device)  # [channels, levels]
+        table = self._tables[key].to(x.device)  # [channels, levels]
         if table.shape[0] != x.shape[-1]:
             raise ValueError("Calibrated table does not match head_dim")
         codes = nearest_level(x.detach().float(), table)
         packed, count = pack_codes(codes, self.config.bits)
-        return self._record(x, packed, count, None, mode="calibrated", key=key)
+        encoded = self._record(x, packed, count, None, mode="calibrated", key=key)
+        encoded.metadata["table_fingerprint"] = self._table_fingerprints[key]
+        self._tables_frozen = True
+        return encoded
 
     def _record(
         self,
@@ -176,49 +235,186 @@ class NonUniformQuantizer(KVQuantizer):
             levels = lloyd_max_gaussian(q.bits).to(q.codes.device)
             restored = levels[codes] / math.sqrt(q.shape[-1]) * q.norms.float()
         elif q.format_id == "nonuniform_calibrated_v1":
-            table = self.tables[tuple(q.metadata["table_key"])].to(q.codes.device)
-            channel = torch.arange(q.shape[-1], device=q.codes.device)
-            restored = table[channel, codes]
+            with self._tables_lock:
+                key = self._validate_table_key(q.metadata["table_key"])
+                if (
+                    q.bits != self.config.bits
+                    or key not in self._tables
+                    or q.metadata.get("table_fingerprint")
+                    != self._table_fingerprints[key]
+                ):
+                    raise ValueError(
+                        "Encoded data does not match this calibrated table"
+                    )
+                table = self._tables[key].to(q.codes.device)
+                if table.shape[0] != q.shape[-1]:
+                    raise ValueError("Calibrated table does not match encoded head_dim")
+                channel = torch.arange(q.shape[-1], device=q.codes.device)
+                restored = table[channel, codes]
+                # A matching record also makes a fresh receiver depend on its
+                # prepared table, even before it encodes anything of its own.
+                self._tables_frozen = True
         else:
             raise ValueError(f"Unsupported non-uniform encoding: {q.format_id}")
-        return restored.to(device=q.device, dtype=q.dtype).contiguous()
+        return finite_cast(restored, q.dtype, device=q.device)
 
     # --------------------------------------------------------------- calibration
+    @staticmethod
+    def _validate_table_key(key: object) -> TableKey:
+        if not isinstance(key, tuple) or len(key) != 2:
+            raise ValueError(
+                "Table key must be (non-negative layer_idx, 'key' or 'value')"
+            )
+        layer, kind = key
+        if (
+            type(layer) is not int
+            or layer < 0
+            or not isinstance(kind, str)
+            or kind not in ("key", "value")
+        ):
+            raise ValueError(
+                "Table key must be (non-negative layer_idx, 'key' or 'value')"
+            )
+        return layer, kind
+
+    def _check_tables_mutable(self) -> None:
+        if self.config.mode != "calibrated":
+            raise ValueError("Table preparation is for mode='calibrated'")
+        if self._tables_frozen:
+            raise RuntimeError(
+                "Calibrated tables are frozen after encoding/decoding; "
+                "create a fresh quantizer and cache to use different tables"
+            )
+
+    def _validate_table(self, table: object) -> torch.Tensor:
+        if (
+            not isinstance(table, torch.Tensor)
+            or table.layout != torch.strided
+            or not table.is_floating_point()
+            or table.ndim != 2
+            or table.shape[0] == 0
+            or table.shape[1] != 2**self.config.bits
+        ):
+            raise ValueError(
+                "Each table must be a dense floating [channels, 2**bits] tensor "
+                "with at least one channel"
+            )
+        owned = (
+            table.detach().to(device="cpu", dtype=torch.float32).contiguous().clone()
+        )
+        if not torch.isfinite(owned).all():
+            raise ValueError("Table levels must be finite in FP32")
+        if (owned[:, 1:] < owned[:, :-1]).any():
+            raise ValueError("Table levels must be sorted in nondecreasing order")
+        return owned
+
+    def _install_tables(self, tables: Dict[TableKey, torch.Tensor]) -> None:
+        """Commit a complete validated update, with no externally owned aliases."""
+        self._check_tables_mutable()
+        fingerprints = {
+            key: hashlib.sha256(
+                str(tuple(table.shape)).encode() + table.numpy().tobytes()
+            ).hexdigest()
+            for key, table in tables.items()
+        }
+        self._tables.update(tables)
+        self._table_fingerprints.update(fingerprints)
+
     def calibrate(self, samples: Mapping[TableKey, torch.Tensor]) -> None:
         """Learn per-channel tables for each ``(layer_idx, "key" | "value")``.
 
         Each value holds sample vectors with head_dim as the last axis, e.g. keys
         collected from calibration prompts. Only used in ``"calibrated"`` mode.
+        All required layers/kinds must be prepared before the first encoding.
+        Invalid sample batches leave previously prepared tables unchanged.
         """
-        if self.config.mode != "calibrated":
-            raise ValueError("calibrate() is for mode='calibrated'")
+        with self._tables_lock:
+            self._calibrate(samples)
+
+    def _calibrate(self, samples: Mapping[TableKey, torch.Tensor]) -> None:
+        self._check_tables_mutable()
+        if not isinstance(samples, Mapping) or not samples:
+            raise ValueError("Calibration samples must be a nonempty mapping")
+        prepared = {}
         for key, tensor in samples.items():
+            key = self._validate_table_key(key)
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or tensor.layout != torch.strided
+                or not tensor.is_floating_point()
+                or tensor.ndim < 1
+                or tensor.numel() == 0
+                or tensor.shape[-1] == 0
+            ):
+                raise ValueError(
+                    "Calibration samples must be nonempty floating vectors"
+                )
             rows = tensor.detach().float().reshape(-1, tensor.shape[-1])
-            self.tables[key] = _kmeans_per_channel(
-                rows, 2**self.config.bits, self.config.calibration_iters
-            ).cpu()
+            if not torch.isfinite(rows).all():
+                raise ValueError("Calibration samples must be finite in FP32")
+            prepared[key] = self._validate_table(
+                _kmeans_per_channel(
+                    rows, 2**self.config.bits, self.config.calibration_iters
+                )
+            )
+        self._install_tables(prepared)
 
     def save(self, path: str) -> None:
+        """Save prepared tables before or after freezing (not live cache records)."""
+        if self.config.mode != "calibrated" or not self._tables:
+            raise ValueError("save() needs prepared calibrated tables")
         torch.save(
             {
                 "bits": self.config.bits,
-                "tables": {f"{layer}:{kind}": t for (layer, kind), t in self.tables.items()},
+                "tables": {
+                    f"{layer}:{kind}": t for (layer, kind), t in self.tables.items()
+                },
             },
             path,
         )
 
     def load(self, path: str) -> None:
-        stored = torch.load(path, map_location="cpu")
+        """Validate all file contents before merging tables into an unused codec."""
+        with self._tables_lock:
+            self._load(path)
+
+    def _load(self, path: str) -> None:
+        self._check_tables_mutable()
+        stored = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(stored, dict) or type(stored.get("bits")) is not int:
+            raise ValueError(
+                "Table file must contain integer bits and a tables mapping"
+            )
         if stored["bits"] != self.config.bits:
             raise ValueError(
                 f"Tables in {path} are {stored['bits']}-bit, not {self.config.bits}-bit"
             )
-        for name, table in stored["tables"].items():
-            layer, kind = name.split(":")
-            self.tables[(int(layer), kind)] = table.float()
+        tables = stored.get("tables")
+        if not isinstance(tables, Mapping) or not tables:
+            raise ValueError("Table file must contain a nonempty tables mapping")
+        prepared = {}
+        for name, table in tables.items():
+            if not isinstance(name, str):
+                raise ValueError(
+                    "Table names must use 'layer_idx:key' or 'layer_idx:value'"
+                )
+            parts = name.split(":")
+            if len(parts) != 2 or not parts[0].isdecimal():
+                raise ValueError(
+                    "Table names must use 'layer_idx:key' or 'layer_idx:value'"
+                )
+            key = self._validate_table_key((int(parts[0]), parts[1]))
+            if name != f"{key[0]}:{key[1]}":
+                raise ValueError(
+                    "Table names must use canonical non-negative layer indices"
+                )
+            prepared[key] = self._validate_table(table)
+        self._install_tables(prepared)
 
 
-def _kmeans_per_channel(rows: torch.Tensor, levels: int, iterations: int) -> torch.Tensor:
+def _kmeans_per_channel(
+    rows: torch.Tensor, levels: int, iterations: int
+) -> torch.Tensor:
     """1-D k-means for every channel at once: ``rows`` [samples, channels] ->
     ascending centroids [channels, levels]. Starts at evenly spaced quantiles."""
     quantiles = (torch.arange(levels, dtype=torch.float32) + 0.5) / levels

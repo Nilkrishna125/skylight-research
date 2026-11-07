@@ -7,13 +7,14 @@ import torch
 
 from ...cache.block import QuantizedTensor
 from ...context import AttentionContext
+from ...numerics import finite_cast
 from ...policies.precision.base import PrecisionPlan
 from ...registry import KVQuantizerRegistry
 from ..base import KVQuantizer, QuantGranularity
 from ..common import (
     check_input,
     fp_grid,
-    group_values,
+    group_for_quantization,
     layout_from_metadata,
     layout_metadata,
     pack_codes,
@@ -64,7 +65,9 @@ class FakeNVFP4Quantizer(KVQuantizer):
         if config.bits != 4 or config.group_size != 16:
             raise ValueError("NVFP4 uses 4-bit values in blocks of 16")
         if not config.symmetric:
-            raise ValueError("NVFP4 is symmetric (signed, no offset); set symmetric=True")
+            raise ValueError(
+                "NVFP4 is symmetric (signed, no offset); set symmetric=True"
+            )
         self.granularity = QuantGranularity(config.granularity)
 
     def quantize(
@@ -74,15 +77,19 @@ class FakeNVFP4Quantizer(KVQuantizer):
         *,
         context: Optional[AttentionContext] = None,
     ) -> QuantizedTensor:
-        check_input(x, plan)
+        check_input(x, plan, allow_keep_tokens=True)
         if plan is not None and plan.bits != 4:
             raise ValueError("NVFP4 precision plan must use 4 bits")
         if self.granularity != QuantGranularity.PER_CHANNEL and x.shape[-1] % 16:
-            raise ValueError(f"NVFP4 needs head_dim to be a multiple of 16, got {x.shape[-1]}")
-        groups, layout = group_values(x, self.granularity, 16)
+            raise ValueError(
+                f"NVFP4 needs head_dim to be a multiple of 16, got {x.shape[-1]}"
+            )
+        groups, layout, _ = group_for_quantization(x, self.granularity, 16, plan)
         amax = groups.abs().amax()
         global_scale = (amax / (E2M1_MAX * E4M3_MAX)).float()
-        global_scale = torch.where(amax > 0, global_scale, torch.ones_like(global_scale))
+        global_scale = torch.where(
+            amax > 0, global_scale, torch.ones_like(global_scale)
+        )
         block_amax = groups.abs().amax(dim=-1, keepdim=True)
         block_scale = (
             (block_amax / (E2M1_MAX * global_scale))
@@ -118,4 +125,4 @@ class FakeNVFP4Quantizer(KVQuantizer):
         )
         scale = q.scales.view(torch.float8_e4m3fn).float() * q.global_scale.float()
         restored = ungroup_values(values * scale, layout, q.shape)
-        return restored.to(device=q.device, dtype=q.dtype).contiguous()
+        return finite_cast(restored, q.dtype, device=q.device)

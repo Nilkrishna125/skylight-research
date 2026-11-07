@@ -75,11 +75,20 @@ class KVQuantizer(ABC):
 
         ``context`` says which layer and tensor kind ``x`` belongs to; quantizers with
         per-layer state (calibrated tables) need it, the others ignore it.
+
+        Codecs that support ``plan.keep_tokens`` exclude those positions from
+        encoding statistics and emit disposable placeholders in the same slots.
+        ``KVQuantization`` saves/restores their exact originals; raw dequantization
+        alone does not restore kept tokens. Other codecs must reject such plans.
         """
 
     @abstractmethod
     def dequantize(self, q: QuantizedTensor) -> torch.Tensor:
-        """Restore the original shape, dtype and device."""
+        """Restore shape/dtype/device, rejecting NaN/inf and saturating finite overflow.
+
+        This is the generic reconstruction boundary rule. Finite values beyond
+        the output dtype's limits clamp to those limits before conversion.
+        """
 
     def fake_quantize(
         self,

@@ -7,12 +7,13 @@ import torch
 
 from ...cache.block import QuantizedTensor
 from ...context import AttentionContext
+from ...numerics import finite_cast
 from ...policies.precision.base import PrecisionPlan
 from ...registry import KVQuantizerRegistry
 from ..base import KVQuantizer, KVQuantizerConfig, QuantGranularity
 from ..common import (
     check_input,
-    group_values,
+    group_for_quantization,
     layout_from_metadata,
     layout_metadata,
     pack_codes,
@@ -67,11 +68,15 @@ class MXFPQuantizer(KVQuantizer):
             )
         bits, self.largest, self.emax = MX_FORMATS[config.format]
         if config.bits != bits:
-            raise ValueError(f"MX {config.format} uses {bits}-bit values; set bits={bits}")
+            raise ValueError(
+                f"MX {config.format} uses {bits}-bit values; set bits={bits}"
+            )
         if config.group_size != 32:
             raise ValueError("MX formats use blocks of 32")
         if not config.symmetric:
-            raise ValueError("MX formats are symmetric (signed, no offset); set symmetric=True")
+            raise ValueError(
+                "MX formats are symmetric (signed, no offset); set symmetric=True"
+            )
         self.granularity = QuantGranularity(config.granularity)
 
     def quantize(
@@ -81,12 +86,14 @@ class MXFPQuantizer(KVQuantizer):
         *,
         context: Optional[AttentionContext] = None,
     ) -> QuantizedTensor:
-        check_input(x, plan)
+        check_input(x, plan, allow_keep_tokens=True)
         if plan is not None and plan.bits != self.config.bits:
             raise ValueError(f"MX precision plan must use {self.config.bits} bits")
         if self.granularity != QuantGranularity.PER_CHANNEL and x.shape[-1] % 32:
-            raise ValueError(f"MX needs head_dim to be a multiple of 32, got {x.shape[-1]}")
-        groups, layout = group_values(x, self.granularity, 32)
+            raise ValueError(
+                f"MX needs head_dim to be a multiple of 32, got {x.shape[-1]}"
+            )
+        groups, layout, _ = group_for_quantization(x, self.granularity, 32, plan)
         amax = groups.abs().amax(dim=-1, keepdim=True)
         exponent = torch.where(
             amax > 0,
@@ -127,4 +134,4 @@ class MXFPQuantizer(KVQuantizer):
         )
         scale = torch.exp2(q.scales.float() - 127)
         restored = ungroup_values(values * scale, layout, q.shape)
-        return restored.to(device=q.device, dtype=q.dtype).contiguous()
+        return finite_cast(restored, q.dtype, device=q.device)

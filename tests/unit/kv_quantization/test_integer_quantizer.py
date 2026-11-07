@@ -14,6 +14,8 @@ from sparse_attention_hub.kv_quantization import (
     QuantGranularity,
 )
 
+pytestmark = pytest.mark.unit
+
 GROUP = 32
 
 
@@ -53,10 +55,14 @@ class TestStorage:
 
         groups = encoded.scales.numel()
         code_bytes = x().numel() * 2 // 8
-        param_bytes = groups * (
-            torch.finfo(scale_dtype.torch_dtype).bits
-            + torch.finfo(offset_dtype.torch_dtype).bits
-        ) // 8
+        param_bytes = (
+            groups
+            * (
+                torch.finfo(scale_dtype.torch_dtype).bits
+                + torch.finfo(offset_dtype.torch_dtype).bits
+            )
+            // 8
+        )
         assert encoded.storage_bytes() == code_bytes + param_bytes
 
     def test_fp16_halves_parameter_overhead(self):
@@ -67,9 +73,10 @@ class TestStorage:
             return IntQuantizer(config).quantize(x()).storage_bytes()
 
         code_bytes = x().numel() * 2 // 8
-        assert bytes_for(ParamDType.FP16) - code_bytes == (
-            bytes_for(ParamDType.FP32) - code_bytes
-        ) // 2
+        assert (
+            bytes_for(ParamDType.FP16) - code_bytes
+            == (bytes_for(ParamDType.FP32) - code_bytes) // 2
+        )
 
     def test_symmetric_stores_no_offset(self):
         config = IntQuantizerConfig(bits=4, symmetric=True)

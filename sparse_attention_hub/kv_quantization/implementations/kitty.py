@@ -21,9 +21,7 @@ class KittyConfig(KVQuantizationConfig):
         default_factory=lambda: IntQuantizerConfig(bits=2, group_size=128)
     )
     precision_policy: ChannelBoostConfig = field(default_factory=ChannelBoostConfig)
-    cache_policy: KittyCachePolicyConfig = field(
-        default_factory=KittyCachePolicyConfig
-    )
+    cache_policy: KittyCachePolicyConfig = field(default_factory=KittyCachePolicyConfig)
 
 
 @KVQuantizationRegistry.register(KittyConfig)

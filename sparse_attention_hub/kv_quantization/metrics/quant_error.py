@@ -36,9 +36,17 @@ class QuantErrorMetric:
         reconstructed: torch.Tensor,
         state: TensorCacheState,
         layer_idx: int,
+        *,
+        start_token: int = 0,
     ) -> None:
-        # Evaluate only quantized token ranges (any region); FP regions have no error.
-        starts = state.encoded_ranges()
+        # HF may expose only a sliding suffix of our full stored history. Compare
+        # only encoded intervals for which this call supplies original values.
+        end_token = start_token + original.shape[-2]
+        starts = [
+            (max(a, start_token) - start_token, min(b, end_token) - start_token)
+            for a, b in state.encoded_ranges()
+            if max(a, start_token) < min(b, end_token)
+        ]
         if not starts:
             return
         before = torch.cat([original[..., a:b, :] for a, b in starts], dim=-2)

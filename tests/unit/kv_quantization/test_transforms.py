@@ -15,7 +15,6 @@ from sparse_attention_hub.kv_quantization import (
     KVQuantizationConfig,
     KVTransform,
     KVTransformRegistry,
-    LearnedRotation,
     LearnedRotationConfig,
     RandomHadamardTransform,
     RandomHadamardTransformConfig,
@@ -25,6 +24,8 @@ from sparse_attention_hub.kv_quantization import (
 from sparse_attention_hub.kv_quantization.transforms.implementations.hadamard import (
     hadamard_matrix,
 )
+
+pytestmark = pytest.mark.unit
 
 DIM = 64
 INT4 = IntQuantizerConfig(bits=4, group_size=DIM)  # per token, one group per vector
@@ -110,7 +111,9 @@ class TestOrthogonalRotations:
     @pytest.mark.parametrize("cls, config", ROTATIONS)
     def test_rotation_lowers_error_on_outlier_channels(self, cls, config):
         x = with_outlier_channels()
-        identity_error = quantization_error(IdentityTransform(IdentityTransformConfig()), x)
+        identity_error = quantization_error(
+            IdentityTransform(IdentityTransformConfig()), x
+        )
         assert quantization_error(cls(config), x) < 0.7 * identity_error
 
 
@@ -124,7 +127,6 @@ class TestHadamard:
             HadamardTransform(HadamardTransformConfig()).forward(
                 torch.randn(1, 1, 4, 48), context()
             )
-
 
 
 class TestRandomHadamard:
@@ -153,7 +155,9 @@ class TestRandomRotation:
         assert not torch.equal(one.matrix(0, "key", DIM), one.matrix(0, "value", DIM))
         assert not torch.equal(one.matrix(0, "key", DIM), one.matrix(1, "key", DIM))
         other_seed = RandomRotation(RandomRotationConfig(seed=1))
-        assert not torch.equal(one.matrix(0, "key", DIM), other_seed.matrix(0, "key", DIM))
+        assert not torch.equal(
+            one.matrix(0, "key", DIM), other_seed.matrix(0, "key", DIM)
+        )
 
     def test_matrix_is_orthogonal(self):
         matrix = RandomRotation(RandomRotationConfig()).matrix(2, "value", DIM)
@@ -183,7 +187,7 @@ class TestInsideKVQuantization:
                     store_codes=store_codes,
                 )
             )
-            return kvq.process(0, keys, values, {})
+            return kvq.process(0, keys, values, {}, num_new_tokens=0)
 
         fake_k, fake_v = run(transform)
         packed_k, packed_v = run(transform, store_codes=True)
@@ -191,6 +195,8 @@ class TestInsideKVQuantization:
         assert fake_k.dtype == torch.bfloat16 and fake_k.shape == keys.shape
 
         plain_k, _ = run(IdentityTransformConfig())
+
         def err(a):
             return ((a.float() - keys.float()).norm() / keys.float().norm()).item()
+
         assert err(fake_k) < 0.7 * err(plain_k)

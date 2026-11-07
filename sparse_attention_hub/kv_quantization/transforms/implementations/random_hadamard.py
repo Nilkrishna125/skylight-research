@@ -6,6 +6,7 @@ from typing import Any, Dict, Tuple
 import torch
 
 from ...context import AttentionContext
+from ...numerics import finite_cast
 from ...registry import KVTransformRegistry
 from ..base import KVTransform, KVTransformConfig, apply_rotation
 from .hadamard import hadamard_matrix
@@ -53,4 +54,4 @@ class RandomHadamardTransform(KVTransform):
         self, x: torch.Tensor, context: AttentionContext, state: Any
     ) -> torch.Tensor:
         matrix = self.matrix(context.layer_idx, context.tensor_kind, x.shape[-1])
-        return apply_rotation(x, matrix.T).to(state)
+        return finite_cast(apply_rotation(x, matrix.T), state)

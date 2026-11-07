@@ -1,6 +1,6 @@
 """KV quantization coordinator and its configuration."""
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple, cast
 
 import torch
@@ -72,9 +72,9 @@ class KVQuantization:
                     else config.cache_policy.local(kind)
                 )
                 if region_config.quantizer is not None:
-                    self.region_quantizers[(kind, region)] = (
-                        KVQuantizer.create_from_config(region_config.quantizer)
-                    )
+                    self.region_quantizers[
+                        (kind, region)
+                    ] = KVQuantizer.create_from_config(region_config.quantizer)
         self.error_metric = QuantErrorMetric() if config.error_metric else None
         self._owner = object()
 
@@ -89,9 +89,17 @@ class KVQuantization:
         values: torch.Tensor,
         meta_data: Dict[str, Any],
         *,
+        num_new_tokens: int,
         phase: str = "decode",
         position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Prepare attention from old stored history plus exact current-call K/V.
+
+        ``num_new_tokens`` is the query sequence length, never the difference
+        between HF cache lengths. Zero imports/inspects completed history for
+        offline codec experiments. Prefill is captured even when attention itself
+        stays full precision; storage updates cannot alter this call's snapshot.
+        """
         if (
             not isinstance(layer_idx, int)
             or isinstance(layer_idx, bool)
@@ -102,14 +110,6 @@ class KVQuantization:
             )
         if phase not in ("prefill", "decode"):
             raise ValueError("kv_quantization_phase must be 'prefill' or 'decode'")
-        if phase == "prefill" and not self.config.quantize_prefill:
-            if CACHE_KEY in meta_data:
-                raise ValueError("Start a fresh request before prefilling new history")
-            record_trace(
-                meta_data, "KVQuantization.process: native prefill", layer=layer_idx
-            )
-            return keys, values
-
         store = meta_data.get(CACHE_KEY)
         if store is None:
             cache_policy = self.config.cache_policy
@@ -128,12 +128,54 @@ class KVQuantization:
                 "Metadata belongs to another quantization configuration; use a fresh request"
             )
 
-        imported = store.append(
-            layer_idx,
-            keys,
-            values,
-            self._encoder(layer_idx, meta_data, phase, position_ids),
-        )
+        store.validate_input(layer_idx, keys, values)
+        if (
+            not isinstance(num_new_tokens, int)
+            or isinstance(num_new_tokens, bool)
+            or not 0 <= num_new_tokens <= keys.shape[-2]
+        ):
+            raise ValueError(
+                "num_new_tokens must be an integer in [0, incoming KV length]"
+            )
+        if keys.shape[-2] == 0:
+            raise ValueError("Cannot prepare attention from empty KV history")
+
+        encode = self._encoder(layer_idx, meta_data, phase, position_ids)
+        seen = store.seen_tokens(layer_idx)
+        past_in_input = int(keys.shape[-2]) - num_new_tokens
+        # A first full-history callback may arrive after native prefill. Seed that
+        # completed context before taking the snapshot. Sliding adapters capture
+        # prefill themselves; evicted context cannot be recovered from a suffix.
+        if seen == 0 or num_new_tokens == 0:
+            if past_in_input < seen:
+                raise ValueError(
+                    "KV history shrank; start a fresh request for rollback"
+                )
+            if past_in_input > seen:
+                store.append(
+                    layer_idx,
+                    keys[..., seen:past_in_input, :],
+                    values[..., seen:past_in_input, :],
+                    encode,
+                )
+                self._compress(
+                    store, layer_idx, meta_data, "before_attention", phase, position_ids
+                )
+        elif past_in_input > seen:
+            raise ValueError(
+                "Missing cached history; capture prefill or start a fresh request"
+            )
+
+        if store.seen_tokens(layer_idx):
+            previous_keys, previous_values = store.get(layer_idx, self._decode_chunk)
+        else:
+            previous_keys, previous_values = keys[..., :0, :], values[..., :0, :]
+        new_keys = keys[..., past_in_input:, :]
+        new_values = values[..., past_in_input:, :]
+        attention_keys = torch.cat([previous_keys, new_keys], dim=-2)
+        attention_values = torch.cat([previous_values, new_values], dim=-2)
+        # These tensors own their data before append/compress can change the store.
+        imported = store.append(layer_idx, new_keys, new_values, encode)
         record_trace(
             meta_data,
             "QuantizedKVStore.append: unseen suffix",
@@ -149,26 +191,46 @@ class KVQuantization:
             phase,
             position_ids,
         )
-        reconstructed_keys, reconstructed_values = store.get(
-            layer_idx, self._decode_chunk
-        )
         record_trace(
             meta_data,
-            "QuantizedKVStore.get: decode + inverse + FP regions",
+            "KVQuantization.process: previous history + original new KV",
             layer=layer_idx,
+            new_tokens=num_new_tokens,
         )
         if self.error_metric is not None:
-            state = store.layers[layer_idx]
-            self.error_metric.log("key", keys, reconstructed_keys, state.key, layer_idx)
-            self.error_metric.log(
-                "value", values, reconstructed_values, state.value, layer_idx
-            )
-            MicroMetricLogger().log(
-                "kv_quantization_store_bytes",
-                store.stats()["store_bytes"],
-                metadata={"layer_idx": layer_idx},
-            )
-        return reconstructed_keys, reconstructed_values
+            logger = MicroMetricLogger()
+            kinds = [
+                kind
+                for kind in ("key", "value")
+                if logger.is_metric_enabled(f"kv_quantization_{kind}_error")
+            ]
+            if kinds:
+                state = store.layers[layer_idx]
+                stored_keys, stored_values = store.get(layer_idx, self._decode_chunk)
+                reference_length = int(keys.shape[-2])
+                reference_start = state.seen_tokens - reference_length
+                for kind, original, reconstructed in (
+                    ("key", keys, stored_keys),
+                    ("value", values, stored_values),
+                ):
+                    if kind in kinds:
+                        self.error_metric.log(
+                            kind,
+                            original,
+                            reconstructed[..., -reference_length:, :],
+                            getattr(state, kind),
+                            layer_idx,
+                            start_token=reference_start,
+                        )
+            if logger.is_metric_enabled("kv_quantization_store_bytes"):
+                logger.log(
+                    "kv_quantization_store_bytes",
+                    store.stats()["store_bytes"],
+                    metadata={"layer_idx": layer_idx},
+                )
+        if phase == "prefill" and not self.config.quantize_prefill:
+            return keys, values
+        return attention_keys, attention_values
 
     def _quantizer_for(self, kind: str, region: str) -> Optional[KVQuantizer]:
         """Middle uses the main quantizer; sink/local use theirs, or None for FP."""
@@ -246,24 +308,32 @@ class KVQuantization:
             start, token_count, context, transform_state=saved, region=region
         )
         if plan is not None and plan.keep_tokens is not None:
-            # Tokens the plan keeps exact: quantize stand-ins (copies of neighbouring
-            # tokens, so the kept values cannot widen any group's range) and store
-            # the originals next to the codes.
+            # The coordinator owns exact originals; the codec owns grouping and
+            # excludes these positions from its numerical statistics. This is the
+            # optional generic keep-token contract, not a paper-specific rule.
             keep = plan.keep_tokens.to(tensor.device)
             chunk.kept_index = keep.flatten().nonzero().flatten().to(torch.int32)
-            chunk.kept_values = tensor.detach().reshape(-1, tensor.shape[-1])[
-                chunk.kept_index.long()
-            ].clone()
-            transformed = fill_kept_tokens(transformed, keep)
-            plan = replace(plan, keep_tokens=None)
+            chunk.kept_values = (
+                tensor.detach()
+                .reshape(-1, tensor.shape[-1])[chunk.kept_index.long()]
+                .clone()
+            )
         encoded = quantizer.quantize(transformed, plan, context=context)
         if self.config.store_codes:
             chunk.quantized = encoded
         else:
-            chunk.dequantized = restore_kept_tokens(
-                transform.inverse(quantizer.dequantize(encoded), context, saved),
-                chunk,
-            ).detach().clone()
+            chunk.dequantized = (
+                restore_kept_tokens(
+                    transform.inverse(quantizer.dequantize(encoded), context, saved),
+                    chunk,
+                )
+                .detach()
+                .clone()
+            )
+            # FAKE storage already contains the exact kept originals. Only packed
+            # chunks need separate originals and indices for future decoding.
+            chunk.kept_index = None
+            chunk.kept_values = None
         return chunk
 
     def _decode_chunk(self, kind: str, chunk: StoredChunk) -> torch.Tensor:
@@ -273,7 +343,11 @@ class KVQuantization:
             return chunk.dequantized
         quantizer = self._quantizer_for(kind, chunk.region)
         transform = self.key_transform if kind == "key" else self.value_transform
-        assert chunk.quantized is not None and quantizer is not None
+        assert (
+            chunk.quantized is not None
+            and quantizer is not None
+            and chunk.context is not None
+        )
         return restore_kept_tokens(
             transform.inverse(
                 quantizer.dequantize(chunk.quantized),
@@ -328,22 +402,6 @@ class KVQuantization:
     def calibrate(self, kv_samples: Any) -> None:
         """TODO: dispatch method-specific calibration and persist its artifacts."""
         raise NotImplementedError("Calibration recipes are scaffolded, not implemented")
-
-
-def fill_kept_tokens(x: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
-    """Replace each kept token by the nearest earlier non-kept token of the same
-    head (or the next one, at the start), so it adds no new values to any group.
-    Heads whose tokens are all kept become zeros."""
-    tokens = x.shape[-2]
-    position = torch.arange(tokens, device=x.device).expand_as(keep)
-    previous = torch.where(~keep, position, -1).cummax(dim=-1).values
-    following = torch.where(~keep, position, tokens).flip(-1).cummin(dim=-1).values
-    following = following.flip(-1)
-    source = torch.where(previous >= 0, previous, following)
-    filled = x.gather(
-        -2, source.clamp(max=tokens - 1)[..., None].expand(*source.shape, x.shape[-1])
-    )
-    return torch.where((source >= tokens)[..., None], torch.zeros_like(filled), filled)
 
 
 def restore_kept_tokens(x: torch.Tensor, chunk: StoredChunk) -> torch.Tensor:

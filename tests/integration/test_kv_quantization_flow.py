@@ -22,14 +22,16 @@ from transformers import (  # noqa: E402
 from sparse_attention_hub.adapters import ModelAdapterHF, Request  # noqa: E402
 from sparse_attention_hub.kv_quantization import (  # noqa: E402
     CACHE_KEY,
+    DefaultCachePolicyConfig,
     IntQuantizerConfig,
     KVQuantizationConfig,
     RegionConfig,
-    DefaultCachePolicyConfig,
 )
 from sparse_attention_hub.sparse_attention.research_attention import (  # noqa: E402
     ResearchAttentionConfig,
 )
+
+pytestmark = pytest.mark.integration
 
 WORDS = [f"w{i}" for i in range(60)]
 NUM_LAYERS = 2
@@ -86,9 +88,7 @@ def _kv_config(store_codes: bool) -> KVQuantizationConfig:
     )
 
 
-def _run(
-    model_dir: str, kv_config: Optional[KVQuantizationConfig]
-) -> Dict[str, Any]:
+def _run(model_dir: str, kv_config: Optional[KVQuantizationConfig]) -> Dict[str, Any]:
     """Answer one question; capture the store's stats just before it is freed."""
     adapter = ModelAdapterHF(
         model_name=model_dir,
@@ -138,7 +138,9 @@ class TestKVQuantizationFlow:
                 + layer["key_recent_tokens"]
                 == layer["seen_tokens"]
             )
-        assert CACHE_KEY not in result["metas"][0], "store must be freed after the question"
+        assert (
+            CACHE_KEY not in result["metas"][0]
+        ), "store must be freed after the question"
 
     def test_fake_and_packed_generate_the_same_text(self, tiny_model_dir: str) -> None:
         fake = _run(tiny_model_dir, _kv_config(store_codes=False))

@@ -75,6 +75,11 @@ from .quantizers.implementations.integer import (  # noqa: F401
     IntQuantizer,
     IntQuantizerConfig,
 )
+from .quantizers.implementations.kivi import (  # noqa: F401
+    KIVI_REFERENCE_REVISION,
+    KIVIQuantizer,
+    KIVIQuantizerConfig,
+)
 from .quantizers.implementations.mxfp import (  # noqa: F401
     MXFPQuantizer,
     MXFPQuantizerConfig,
@@ -103,13 +108,13 @@ from .transforms.implementations.identity import (  # noqa: F401
     IdentityTransform,
     IdentityTransformConfig,
 )
-from .transforms.implementations.random_hadamard import (  # noqa: F401
-    RandomHadamardTransform,
-    RandomHadamardTransformConfig,
-)
 from .transforms.implementations.learned_rotation import (  # noqa: F401
     LearnedRotation,
     LearnedRotationConfig,
+)
+from .transforms.implementations.random_hadamard import (  # noqa: F401
+    RandomHadamardTransform,
+    RandomHadamardTransformConfig,
 )
 from .transforms.implementations.random_rotation import (  # noqa: F401
     RandomRotation,

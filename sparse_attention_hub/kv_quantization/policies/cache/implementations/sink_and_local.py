@@ -42,9 +42,7 @@ class SinkAndLocalCachePolicyConfig(CachePolicyConfig):
     """
 
     key_local: RegionConfig = field(default_factory=lambda: RegionConfig(tokens=128))
-    value_local: RegionConfig = field(
-        default_factory=lambda: RegionConfig(tokens=128)
-    )
+    value_local: RegionConfig = field(default_factory=lambda: RegionConfig(tokens=128))
 
 
 @CachePolicyRegistry.register(SinkAndLocalCachePolicyConfig)
@@ -74,9 +72,7 @@ class KittyCachePolicyConfig(CachePolicyConfig):
     key_sink: RegionConfig = field(default_factory=lambda: RegionConfig(tokens=32))
     value_sink: RegionConfig = field(default_factory=lambda: RegionConfig(tokens=32))
     key_local: RegionConfig = field(default_factory=lambda: RegionConfig(tokens=128))
-    value_local: RegionConfig = field(
-        default_factory=lambda: RegionConfig(tokens=128)
-    )
+    value_local: RegionConfig = field(default_factory=lambda: RegionConfig(tokens=128))
 
 
 @CachePolicyRegistry.register(KittyCachePolicyConfig)

@@ -24,6 +24,8 @@ from sparse_attention_hub.kv_quantization.quantizers.common import (
     round_to_grid,
 )
 
+pytestmark = pytest.mark.unit
+
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
 
@@ -73,7 +75,11 @@ class TestShared:
     def test_blocks_along_tokens(self, config, cls):
         """PER_CHANNEL puts the blocks along tokens (KIVI-style keys)."""
         x = gaussian(tokens=48)
-        per_channel = cls(config.__class__(**{**config.__dict__, "granularity": QuantGranularity.PER_CHANNEL}))
+        per_channel = cls(
+            config.__class__(
+                **{**config.__dict__, "granularity": QuantGranularity.PER_CHANNEL}
+            )
+        )
         restored = per_channel.fake_quantize(x)
         assert restored.shape == x.shape
         assert ((x - restored).norm() / x.norm()).item() < 0.2
@@ -85,10 +91,12 @@ class TestShared:
         for store_codes in (False, True):
             kvq = KVQuantization.create_from_config(
                 KVQuantizationConfig(
-                    key_quantizer=config, value_quantizer=config, store_codes=store_codes
+                    key_quantizer=config,
+                    value_quantizer=config,
+                    store_codes=store_codes,
                 )
             )
-            outputs.append(kvq.process(0, keys, values, {}))
+            outputs.append(kvq.process(0, keys, values, {}, num_new_tokens=0))
         assert torch.equal(outputs[0][0], outputs[1][0])
         assert torch.equal(outputs[0][1], outputs[1][1])
 
@@ -104,7 +112,15 @@ class TestGrid:
     def test_ties_round_to_even(self):
         grid = torch.tensor(E2M1)
         ties = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
-        assert grid[round_to_grid(ties, grid)].tolist() == [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]
+        assert grid[round_to_grid(ties, grid)].tolist() == [
+            0.0,
+            1.0,
+            1.0,
+            2.0,
+            2.0,
+            4.0,
+            4.0,
+        ]
 
     def test_nearest_and_clamped(self):
         grid = torch.tensor(E2M1)
@@ -164,11 +180,15 @@ class TestFakeNVFP4:
     def test_e2m1_values_are_exact_at_full_scale(self):
         # amax 6 -> global scale 6 / 2688, block scale exactly 448 (E4M3), scale 1.
         x = one_token(E2M1 + [-v for v in E2M1])
-        assert torch.equal(FakeNVFP4Quantizer(FakeNVFP4QuantizerConfig()).fake_quantize(x), x)
+        assert torch.equal(
+            FakeNVFP4Quantizer(FakeNVFP4QuantizerConfig()).fake_quantize(x), x
+        )
 
     def test_each_block_gets_its_own_scale(self):
         first = E2M1 + [-v for v in E2M1]  # block amax 6
-        second = [v / 2 for v in first]  # block amax 3 -> block scale 224, exact in E4M3
+        second = [
+            v / 2 for v in first
+        ]  # block amax 3 -> block scale 224, exact in E4M3
         x = one_token(first + second)
         quantizer = FakeNVFP4Quantizer(FakeNVFP4QuantizerConfig())
         encoded = quantizer.quantize(x)
@@ -188,7 +208,9 @@ class TestFakeNVFP4:
 
     def test_head_dim_must_be_a_multiple_of_16(self):
         with pytest.raises(ValueError, match="multiple of 16"):
-            FakeNVFP4Quantizer(FakeNVFP4QuantizerConfig()).quantize(gaussian(channels=24))
+            FakeNVFP4Quantizer(FakeNVFP4QuantizerConfig()).quantize(
+                gaussian(channels=24)
+            )
 
     def test_fixed_format_settings(self):
         with pytest.raises(ValueError, match="blocks of 16"):
@@ -223,8 +245,14 @@ class TestMXFP:
 
     def test_storage(self):
         x = gaussian()
-        assert MXFPQuantizer(MX4).quantize(x).storage_bytes() == x.numel() // 2 + x.numel() // 32
-        assert MXFPQuantizer(MX8).quantize(x).storage_bytes() == x.numel() + x.numel() // 32
+        assert (
+            MXFPQuantizer(MX4).quantize(x).storage_bytes()
+            == x.numel() // 2 + x.numel() // 32
+        )
+        assert (
+            MXFPQuantizer(MX8).quantize(x).storage_bytes()
+            == x.numel() + x.numel() // 32
+        )
 
     def test_power_of_two_scale_costs_accuracy_versus_nvfp4(self):
         x = gaussian()

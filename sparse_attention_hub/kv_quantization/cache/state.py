@@ -41,6 +41,7 @@ class TensorCacheState:
 
 @dataclass
 class LayerKVState:
+    # Total tokens captured by our store, independently of HF's retained window.
     seen_tokens: int = 0
     key: TensorCacheState = field(default_factory=TensorCacheState)
     value: TensorCacheState = field(default_factory=TensorCacheState)

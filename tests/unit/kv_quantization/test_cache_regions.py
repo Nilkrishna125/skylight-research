@@ -11,16 +11,18 @@ import torch
 
 from sparse_attention_hub.kv_quantization import (
     CACHE_KEY,
+    DefaultCachePolicyConfig,
     IntQuantizer,
     IntQuantizerConfig,
-    KIVIConfig,
     KittyConfig,
+    KIVIConfig,
     KVQuantization,
     KVQuantizationConfig,
     QuantGranularity,
     RegionConfig,
-    DefaultCachePolicyConfig,
 )
+
+pytestmark = pytest.mark.unit
 
 HEADS = 2
 DIM = 32
@@ -67,12 +69,14 @@ def make(
 
 
 def feed(kvq: KVQuantization, k: torch.Tensor, v: torch.Tensor, steps, meta=None):
-    """Call process with growing prefixes of the history (prefill, then decode)."""
+    """Inspect growing completed histories after storage/compression (no queries)."""
     meta = {} if meta is None else meta
     out_k: Optional[torch.Tensor] = None
     out_v: Optional[torch.Tensor] = None
     for t in steps:
-        out_k, out_v = kvq.process(0, k[..., :t, :], v[..., :t, :], meta)
+        out_k, out_v = kvq.process(
+            0, k[..., :t, :], v[..., :t, :], meta, num_new_tokens=0
+        )
     return out_k, out_v, meta
 
 
@@ -182,9 +186,7 @@ class TestWholeHistory:
 
     def test_encoded_tokens_count_every_quantized_region(self):
         k, v = history(64), history(64, seed=1)
-        kvq = make(
-            key_sink=RegionConfig(4, INT8), key_local=RegionConfig(16, INT4)
-        )
+        kvq = make(key_sink=RegionConfig(4, INT8), key_local=RegionConfig(16, INT4))
         _, _, meta = feed(kvq, k, v, [64])
         stats = layer_stats(meta)
         assert stats["key_encoded_tokens"] == 64
@@ -224,7 +226,7 @@ class TestMethodSchedulesAreSettings:
         k, v = history(300), history(300, seed=1)
         meta: dict = {}
         for t in range(1, 301):
-            kvq.process(0, k[..., :t, :], v[..., :t, :], meta)
+            kvq.process(0, k[..., :t, :], v[..., :t, :], meta, num_new_tokens=0)
             stats = layer_stats(meta)
             assert stats["key_recent_tokens"] == t % 128
             assert stats["key_compressed_tokens"] == t - t % 128
@@ -242,7 +244,7 @@ class TestMethodSchedulesAreSettings:
         k, v = history(330), history(330, seed=1)
         meta: dict = {}
         for t in range(1, 331):
-            kvq.process(0, k[..., :t, :], v[..., :t, :], meta)
+            kvq.process(0, k[..., :t, :], v[..., :t, :], meta, num_new_tokens=0)
             stats = layer_stats(meta)
             after_sink = max(0, t - 32)
             assert stats["key_sink_tokens"] == stats["value_sink_tokens"] == min(t, 32)

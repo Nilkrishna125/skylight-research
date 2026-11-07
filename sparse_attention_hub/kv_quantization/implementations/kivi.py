@@ -8,8 +8,9 @@ from ..policies.cache.base import RegionConfig
 from ..policies.cache.implementations.sink_and_local import (
     SinkAndLocalCachePolicyConfig,
 )
-from ..quantizers.base import QuantGranularity
+from ..quantizers.base import KVQuantizerConfig, QuantGranularity
 from ..quantizers.implementations.integer import IntQuantizerConfig
+from ..quantizers.implementations.kivi import KIVIQuantizerConfig
 from ..registry import KVQuantizationRegistry
 
 
@@ -25,21 +26,20 @@ class KIVIConfig(KVQuantizationConfig):
     - buffering (``SinkAndLocalCachePolicyConfig``): keys wait in full precision
       until R = 128 have collected and are then quantized together; values keep a
       rolling full-precision window of the newest R = 128;
-    - scales and minimums are stored in FP16.
+    - the default KIVIQuantizer follows the released input-dtype arithmetic;
+      FP16 inputs store FP16 scales/minima, FP32 inputs store FP32 parameters.
 
     Every field can be changed for experiments (other bits, group sizes, R, sinks,
     transforms, precision policies, parameter dtypes). ``KIVI`` checks only what
     makes it KIVI; ``with_settings`` builds the common variants.
     """
 
-    key_quantizer: IntQuantizerConfig = field(
-        default_factory=lambda: IntQuantizerConfig(
+    key_quantizer: KVQuantizerConfig = field(
+        default_factory=lambda: KIVIQuantizerConfig(
             bits=2, granularity=QuantGranularity.PER_CHANNEL
         )
     )
-    value_quantizer: IntQuantizerConfig = field(
-        default_factory=lambda: IntQuantizerConfig(bits=2)
-    )
+    value_quantizer: KVQuantizerConfig = field(default_factory=KIVIQuantizerConfig)
     cache_policy: SinkAndLocalCachePolicyConfig = field(
         default_factory=SinkAndLocalCachePolicyConfig
     )
@@ -58,10 +58,12 @@ class KIVIConfig(KVQuantizationConfig):
         ``error_metric``, ``key_transform``, ...).
         """
         return cls(
-            key_quantizer=IntQuantizerConfig(
-                bits=bits, granularity=QuantGranularity.PER_CHANNEL, group_size=group_size
+            key_quantizer=KIVIQuantizerConfig(
+                bits=bits,
+                granularity=QuantGranularity.PER_CHANNEL,
+                group_size=group_size,
             ),
-            value_quantizer=IntQuantizerConfig(bits=bits, group_size=group_size),
+            value_quantizer=KIVIQuantizerConfig(bits=bits, group_size=group_size),
             cache_policy=SinkAndLocalCachePolicyConfig(
                 key_local=RegionConfig(residual_length),
                 value_local=RegionConfig(residual_length),
@@ -74,9 +76,9 @@ class KIVIConfig(KVQuantizationConfig):
 class KIVI(KVQuantization):
     """The KIVI recipe: generic components with KIVI's settings and checks.
 
-    Quantization, buffering and storage are the shared components (IntQuantizer,
-    SinkAndLocalCachePolicy, QuantizedKVStore); this class only validates that the
-    configuration is a KIVI configuration before building them.
+    The default numerical codec is KIVIQuantizer, with shared buffering and storage.
+    Explicit IntQuantizerConfig overrides retain the old generic arithmetic for
+    labelled experiments. They do not claim released-reference numerical parity.
     """
 
     def __init__(self, config: KIVIConfig) -> None:
@@ -87,10 +89,12 @@ class KIVI(KVQuantization):
 def validate_kivi(config: KVQuantizationConfig) -> None:
     """Raise if ``config`` breaks what defines KIVI (other settings are free)."""
     keys, values = config.key_quantizer, config.value_quantizer
-    if not isinstance(keys, IntQuantizerConfig) or not isinstance(
-        values, IntQuantizerConfig
-    ):
-        raise ValueError("KIVI uses integer quantizers (IntQuantizerConfig) for K and V")
+    if not isinstance(
+        keys, (IntQuantizerConfig, KIVIQuantizerConfig)
+    ) or not isinstance(values, (IntQuantizerConfig, KIVIQuantizerConfig)):
+        raise ValueError(
+            "KIVI uses integer quantizers (KIVIQuantizerConfig or IntQuantizerConfig) for K and V"
+        )
     if QuantGranularity(keys.granularity) != QuantGranularity.PER_CHANNEL:
         raise ValueError("KIVI quantizes keys per channel (PER_CHANNEL)")
     if QuantGranularity(values.granularity) == QuantGranularity.PER_CHANNEL:
@@ -100,6 +104,12 @@ def validate_kivi(config: KVQuantizationConfig) -> None:
             "KIVI buffers keys and keeps a rolling value window; use "
             "SinkAndLocalCachePolicyConfig"
         )
+    for quantizer in (keys, values):
+        if type(quantizer.group_size) is not int or quantizer.group_size < 1:
+            raise ValueError("KIVI group_size must be a positive integer")
+    for region in (config.cache_policy.key_local, config.cache_policy.value_local):
+        if type(region.tokens) is not int or region.tokens < 1:
+            raise ValueError("KIVI residual lengths must be positive integers")
     residual = config.cache_policy.key_local.tokens
     if residual % keys.group_size:
         raise ValueError(
