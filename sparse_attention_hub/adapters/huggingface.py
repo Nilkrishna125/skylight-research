@@ -11,6 +11,7 @@ from tqdm import tqdm
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+from ..kv_quantization.attention_mask import align_attention_mask
 from ..sparse_attention.base import SparseAttention, SparseAttentionConfig
 from ..sparse_attention.research_attention.base import ResearchAttention
 from .base import ModelAdapter, Request, RequestResponse
@@ -304,7 +305,7 @@ class ModelAdapterHF(ModelAdapter):
             attention_mask: Optional[torch.Tensor],
             scaling: float = 1.0,
             dropout: float = 0.0,
-            **kwargs: Dict[str, Any],
+            **kwargs: Any,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
             """Custom attention callable for HuggingFace integration."""
             if hasattr(module, "layer_idx"):
@@ -322,7 +323,8 @@ class ModelAdapterHF(ModelAdapter):
 
             capture = sparse_meta_data.get("kv_quantization_capture_only")
             if capture is not None:
-                sparse_attention.quantize_kv(
+                source_key_length = int(keys.shape[-2])
+                prepared_keys, prepared_values = sparse_attention.quantize_kv(
                     keys,
                     values,
                     sparse_meta_data,
@@ -330,6 +332,27 @@ class ModelAdapterHF(ModelAdapter):
                     **kwargs,
                 )
                 implementation = capture[id(module)]
+                quantization = sparse_attention.kv_quantization
+                if quantization is not None and quantization.config.quantize_prefill:
+                    keys, values = prepared_keys, prepared_values
+                    target_key_length = int(keys.shape[-2])
+                    # Preserve the native mask format when positions are unchanged:
+                    # FlashAttention can use a 2D padding mask instead of 4D.
+                    if target_key_length != source_key_length:
+                        if implementation not in ("eager", "sdpa"):
+                            raise NotImplementedError(
+                                "Longer reconstructed prefill history requires eager or sdpa"
+                            )
+                        window = kwargs.get("sliding_window")
+                        attention_mask = align_attention_mask(
+                            attention_mask,
+                            source_key_length=source_key_length,
+                            target_key_length=target_key_length,
+                            query_length=int(queries.shape[-2]),
+                            dtype=queries.dtype,
+                            device=queries.device,
+                            sliding_window=window if isinstance(window, int) else None,
+                        )
                 if implementation == "eager":
                     native_attention = getattr(
                         import_module(type(module).__module__),

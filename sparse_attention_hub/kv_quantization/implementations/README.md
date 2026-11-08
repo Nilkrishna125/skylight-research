@@ -9,8 +9,8 @@ parent package. The generic baseline is configured through
 |---|---|---|---|
 | [KIVI](#kivi) | `KIVIConfig` / `KIVI` | [kivi.py](kivi.py) | Implemented portable numerical/cache path |
 | Kitty | `KittyConfig` / `Kitty` | [kitty.py](kitty.py) | Scaffold |
-| QuaRot KV | `QuaRotKVConfig` / `QuaRotKV` | [quarot_kv.py](quarot_kv.py) | Scaffold |
-| TurboQuant KV | `TurboQuantKVConfig` / `TurboQuantKV` | [turboquant_kv.py](turboquant_kv.py) | Scaffold |
+| [QuaRot KV](#quarot-kv) | `QuaRotKVConfig` / `QuaRotKV` | [quarot_kv.py](quarot_kv.py) | Implemented portable accuracy-profile KV path |
+| [TurboQuant KV](#turboquant-kv) | `TurboQuantKVConfig` / `TurboQuantKV` | [turboquant_kv.py](turboquant_kv.py) | Implemented portable MSE/prod mathematical profiles |
 | KVQuant NUQ | `KVQuantNUQConfig` / `KVQuantNUQ` | [kvquant_nuq.py](kvquant_nuq.py) | Scaffold |
 | NVFP4 KV | `NVFP4KVConfig` / `NVFP4KV` | [nvfp4_kv.py](nvfp4_kv.py) | Scaffold |
 
@@ -106,3 +106,358 @@ These tests require no pretrained model weights or evaluation datasets.
   numerically equivalent to sequential calls crossing buffer boundaries.
 - CPU reference/callback checks do not establish fused CUDA equivalence,
   pretrained task quality, total GPU-memory savings or inference speed.
+
+## QuaRot KV
+
+QuaRot KV uses the authors' accuracy-path quantizer with Hadamard preprocessing,
+packed storage and reconstruction into the original attention coordinates.
+Weights and ordinary model activations keep their existing precision.
+
+### Reference
+
+The reference is [spcl/QuaRot](https://github.com/spcl/QuaRot) at commit
+5008669b08c1f11f9b64d52d16fddd47ca754c5a:
+
+- [fake_quant/quant_utils.py](https://github.com/spcl/QuaRot/blob/5008669b08c1f11f9b64d52d16fddd47ca754c5a/fake_quant/quant_utils.py):
+  ActQuantizer, integer zero points, clipping and encode/decode arithmetic.
+- [fake_quant/rotation_utils.py](https://github.com/spcl/QuaRot/blob/5008669b08c1f11f9b64d52d16fddd47ca754c5a/fake_quant/rotation_utils.py):
+  post-RoPE Q/K rotation and V/O projection preparation.
+- [fake_quant/main.py](https://github.com/spcl/QuaRot/blob/5008669b08c1f11f9b64d52d16fddd47ca754c5a/fake_quant/main.py):
+  head-wise key and grouped value quantizer installation.
+- [Paper](https://arxiv.org/pdf/2404.00456): experimental setup and KV-only ablation.
+
+The numerical functions and ActQuantizer are adapted directly into our
+[quantizer](../quantizers/implementations/quarot.py), with type annotations and
+a local no-op cleanup shim instead of upstream experiment dependencies. Their
+numerical bodies are checked against the pinned source. There is no vendor
+package. Apache-2.0 attribution/license is retained in
+[LICENSE-QUAROT](../LICENSE-QUAROT) and packaged with the library.
+
+### Defaults and numerical behavior
+
+- Asymmetric INT4 K/V, groups of 128 channels and clipping ratio 0.95.
+- Key groups cover one token's whole KV head; value groups cover channels within
+  a token/head. Groups must be complete. Key group size must equal head_dim;
+  value group size must divide it. Other sizes are explicit experimental profiles.
+- The existing HadamardTransform uses preserve_input_dtype=True. It computes the
+  rotation in FP32 and casts back before quantization. Its default False remains
+  unchanged for existing generic configurations.
+- Both previous and arriving tokens are quantized before attention. There is no
+  exact residual or sink region. Quantized prefill is enabled by default.
+- Bits 2, 3, 4 and 8 are supported independently for K/V. Compact unsigned codes
+  use format quarot_accuracy_int_v1 and a continuous bitstream; 3-bit codes really
+  occupy ceil(code_count * 3 / 8) payload bytes.
+- FP16 is the primary profile. FP32 helper checks and BF16 experiments are also
+  supported; those do not establish CUDA-backend parity.
+
+Parameters follow the actual upstream call paths. With FP16 inputs, head-wise
+keys use FP32 scales/zero points, while grouped values use FP16 parameters.
+The difference comes from the authors' zero-including key range calculation.
+The explicit parameter_dtype="upstream_path" configuration records this rule;
+inherited scale_dtype/offset_dtype retain unused defaults, as with KIVI.
+Independent parameter-dtype overrides are rejected.
+
+The upstream CLI defaults differ from the paper's asymmetric G128/0.95 profile;
+the named recipe selects those settings explicitly. Symmetric experiments use
+the authors' full signed range (INT4 includes -8), with reversible unsigned
+code bias in our storage.
+
+All-zero groups keep the reference handling. Undefined nonzero constant
+asymmetric value groups, scale underflow and nonfinite inputs/parameters raise
+errors before invalid codes can be stored. Finite reconstruction overflow follows
+the framework's saturation rule. These guards are documented extensions around
+undefined reference cases; no epsilon is silently added to the quantizer.
+
+### Implementation and call flow
+
+| File | Responsibility |
+|---|---|
+| [Recipe](quarot_kv.py) | Configuration, validation, process override selecting current-token reconstruction |
+| [Quantizer](../quantizers/implementations/quarot.py) | Adapted authors' numerics, native arithmetic dtypes, compact parameters and record validation |
+| [Hadamard transform](../transforms/implementations/hadamard.py) | Shared matrix/inverse with optional forward dtype preservation |
+| [Packing](../quantizers/common.py) | Cross-byte bitstream packing/unpacking; existing codecs retain their layout |
+| [Coordinator](../base.py) | Shared _process_kv_history helper; default process preserves KIVI's exact-current ordering |
+| [HF adapter](../../adapters/huggingface.py) | Feed prepared prefill K/V to native attention when requested |
+| [Reference fixtures](../../../tests/reference/quarot) | Hash-verified authors' sources, provenance, Apache license and independent loader |
+
+~~~text
+HF post-RoPE K/V
+  -> identify arriving tokens
+  -> Hadamard -> input-dtype cast -> reference quantizer -> store
+  -> decode history including arriving tokens -> inverse Hadamard
+  -> existing attention with unchanged queries
+~~~
+
+Returning decoded rotated keys multiplied by H.T is algebraically equivalent
+to rotating queries in the dot product. Returning decoded values multiplied by
+H.T similarly moves the inverse output rotation before attention. Thus
+ResearchAttention and its maskers require no rotation-specific edits.
+
+This changes floating-point operation order: the authors rotate Q explicitly
+and incorporate V rotations into projection weights. Our original-coordinate
+reconstruction is not claimed bit-identical to that full model preparation.
+The dedicated codec itself is checked exactly on the same rotated input.
+
+Prefill keeps the native mask format when token positions/lengths are unchanged.
+For longer independent history, eager/SDPA prefill uses the existing mask alignment
+helper. Other native backends explicitly reject that longer-history case.
+Storage retention and native sliding visibility remain separate.
+
+### Usage and tests
+
+~~~python
+from sparse_attention_hub.kv_quantization import QuaRotKVConfig
+from sparse_attention_hub.sparse_attention.research_attention import ResearchAttentionConfig
+
+config = ResearchAttentionConfig(
+    masker_configs=[],
+    kv_quantization_config=QuaRotKVConfig(store_codes=True),
+)
+~~~
+
+The default requires head_dim=128. For another head dimension, explicitly set
+the key/value QuaRotQuantizerConfig.group_size values and preserve the key's
+parameter_mode="key_head". Setting store_codes=False selects FAKE storage.
+Setting quantize_prefill=False is an explicit native-prefill experiment.
+
+~~~bash
+python tutorials/py_examples/06_quarot_kv_demo.py --device cpu
+python tutorials/py_examples/06_quarot_kv_demo.py --device cpu --bits 3
+python -m pytest -q tests/unit/kv_quantization/test_quarot_reference.py tests/unit/kv_quantization/test_quarot_preset.py tests/unit/kv_quantization/test_bitstream_packing.py
+python -m pytest -q -m integration tests/integration/test_kv_quantization_quarot_flow.py
+python -m pytest -q -m unit tests/unit/kv_quantization
+python -m pytest -q -m integration tests/integration/test_kv_quantization*.py tests/integration/test_kivi_reference_flow.py
+~~~
+
+The demo constructs a tiny random Llama with head_dim=128 and identical forced
+tokens/weights for native, FAKE and PACKED runs. It prints cache counts and owned
+store bytes and checks FAKE/PACKED logits. It downloads no models or datasets.
+
+Unit tests check exact logical codes, parameter values/dtypes and reconstruction
+against the pinned source, including signed/asymmetric paths and 3-bit packing.
+Integration tests exercise Llama, Qwen3 and Mistral with GQA, chunked prefill,
+multi-token decoding, dtype-aware independent reconstruction, actual eager/SDPA
+prefill, cleanup and an offline benchmark worker. Source codec checks are exact;
+independent matrix/attention checks allow explicitly bounded floating-point
+roundoff. FAKE/PACKED logits must agree exactly.
+
+Validation of this implementation on CPU used Python 3.10, PyTorch 2.8.0 and
+Transformers 4.57.1:
+
+- The full focused command below passed **1,650 tests**, with **one existing
+  expected failure** for the deferred after-attention extension. It includes
+  KIVI, generic quantization, adapter and benchmark regression checks.
+- The 3-bit and 4-bit offline demos both produced identical FAKE/PACKED logits.
+- Black, isort and flake8 passed on the changed Python files. The six changed
+  implementation modules passed focused mypy checks and the configured pylint
+  score threshold.
+- A built wheel was extracted and imported independently of the checkout; its
+  QuaRot codec/recipe, packaged Apache license, packed prefill and request cleanup
+  passed a smoke test.
+
+~~~bash
+python -m pytest -q tests/unit/kv_quantization tests/integration/test_kv_quantization*.py tests/integration/test_kivi_reference_flow.py tests/unit/benchmark/test_config_serialization.py tests/unit/benchmark/test_quantization_test_categories.py tests/unit/benchmark/test_supported_runtime.py tests/unit/adapters
+~~~
+
+### Scope and remaining work
+
+- This is KV-only QuaRot with original-coordinate reconstruction. Full-model
+  norm fusion, residual/FFN rotations, weight quantization/GPTQ and ordinary
+  activation quantization are not implemented here.
+- The separate upstream MultiLayerPagedKVCache4Bit uses different asymmetric
+  numerics, a range floor and native prefill. This accuracy-profile recipe does
+  not claim to reproduce that cache or its fused CUDA attention.
+- The current transform uses the existing matrix implementation. A future
+  optional fast-Hadamard backend should be checked against the upstream pinned
+  submodule revision 4ea722e434e3d4f2a14522341959ebdbe62be2de.
+- Our quantized store coexists with the native unquantized HF cache. Report
+  owned-store bytes separately from model memory and dense reconstruction
+  temporaries. The current tests establish no overall GPU-memory or speed gain.
+- GPU kernel parity and pretrained task-quality evaluation remain unverified.
+
+
+## TurboQuant KV
+
+This implements the uniform whole-head MSE and prod algorithms from
+[arXiv:2504.19874v1](https://arxiv.org/html/2504.19874v1), Algorithms 1/2,
+Sections 2.2, 3.1 and 3.2. It is an independent implementation of those
+mathematical algorithms. No author-released TurboQuant code was available in
+the sources reviewed. Community code from 0xSero/turboquant is not copied or
+used as an official reference. The separate authors' QJL repository is not a
+TurboQuant cache implementation.
+
+### Algorithms and numerical policy
+
+For a row vector x in one token's KV head, the codec stores its FP32 norm rho
+and uses u=x/rho (zero vectors have an explicit zero reconstruction):
+
+~~~text
+MSE:
+  rotated = u @ R
+  indices = nearest_level(rotated, levels)
+  coarse = levels[indices] @ R.T
+  reconstructed = rho * coarse
+
+prod with b total nominal bits:
+  coarse = MSE reconstruction of u using b-1 bits
+  residual = u - coarse                     # original coordinates
+  gamma = norm(residual)
+  signs = sign(residual @ S.T)               # iid Gaussian S, independent of R
+  correction = sqrt(pi/2) / head_dim * gamma * (signs @ S)
+  reconstructed = rho * (coarse + correction)
+~~~
+
+Prod's 1-bit profile uses a zero coarse estimate and no coarse index stream.
+It never calls a zero-bit packing helper. Zero sign projections select +1.
+Codebook midpoint ties select the lower code. The result is not renormalized.
+QJL's unbiased dot-product property does not establish unbiased softmax or
+unbiased final model outputs.
+
+The default table is Lloyd-Max for the finite-dimensional sphere-coordinate
+density proportional to (1-z²)^((d-3)/2). Codebooks are independent of samples
+and keyed by head dimension and coarse bit width. A CPU FP64 Gauss-Legendre
+solver uses the z=sin(theta) change of variables, order 96, a 1e-11 convergence
+threshold and at most 2000 iterations; nonconvergence raises an error. The
+optional codebook_distribution="gaussian_limit" is a labelled experiment.
+
+Runtime normalization, rotation, residuals and reconstruction use FP32; outputs
+are cast to the input FP16/BF16/FP32 dtype. A scaled norm calculation avoids
+squaring raw large/small magnitudes. Nonfinite inputs/parameters/arithmetic raise
+errors; finite output-dtype overflow uses the framework's saturating cast.
+These dtype, solver, tie and edge rules are our explicit numerical contract,
+not claims about unpublished author kernels. Exported configurations include
+reference="arxiv:2504.19874v1:algorithms-1-2" and a numerics_version.
+
+The codec reuses RandomRotation's seeded FP64 Gaussian QR construction, with
+FP32 stored matrices. It creates a separate iid Gaussian QJL matrix when needed.
+Matrices remain fixed per codec/layer/K-or-V/head dimension, are independent of
+input samples and do not consume the global PyTorch RNG. Inspection returns
+copies. Records carry table/matrix fingerprints; incompatible decoders reject
+rather than silently interpreting codes with different resources. Fingerprints
+also detect RNG/QR differences across runtime versions when moving records.
+
+### Files and flow
+
+| File | Responsibility |
+|---|---|
+| [Recipe](turboquant_kv.py) | TurboQuantKVConfig, named-profile validation and current-token reconstruction |
+| [Codec](../quantizers/implementations/turboquant.py) | Sphere codebooks, norm/rotation, MSE indices, QJL correction, record validation and shared-resource byte accounting |
+| [Encoded record](../cache/block.py) | Existing norms plus optional qjl_codes/residual_norms, included in storage_bytes() |
+| [Independent references](../../../tests/reference/turboquant) | NumPy FP64 algebra, Python bitstream decoder, analytic/Beta moment checks and fixed vectors |
+| [Demo](../../../tutorials/py_examples/07_turboquant_kv_demo.py) | Offline random-model native/FAKE/PACKED flow and memory breakdown |
+
+~~~text
+HF K/V -> identify arriving suffix -> append to request-local history
+  -> identity outer transform
+  -> codec: normalize -> rotate -> encode MSE / optional QJL residual
+  -> packed store -> decode complete history, including arriving tokens
+  -> original-coordinate K/V -> existing attention and unchanged queries
+~~~
+
+TurboQuantKV.process() selects reconstruct_current=True on the shared
+_process_kv_history() helper. FullQuantizationCachePolicy keeps no exact sinks
+or residual region. Quantized prefill is on by default; an explicit
+quantize_prefill=False experiment still captures/compresses the context for
+subsequent calls. Completed history is not requantized. Our cache retains full
+history while the existing adapter/attention mask alignment preserves native
+sliding/padding visibility. ResearchAttention, HF's cache class and its query
+handling need no additional edits for TurboQuant.
+
+### Storage and configuration
+
+Both K/V default to 3-bit MSE with packed storage. Whole-head dimensions >=2
+are supported, including non-powers of two. K/V may have different dimensions
+and independently configured bit widths/variants. Precision policies that
+assign mixed-channel bits or exact-token regions are rejected for this named
+profile. Inherited group_size/scale_dtype/offset_dtype settings are unused and
+must retain their defaults; actual vectors span the entire KV head and norms
+are FP32.
+
+~~~python
+from sparse_attention_hub.kv_quantization import (
+    TurboQuantKVConfig, TurboQuantQuantizerConfig,
+)
+from sparse_attention_hub.sparse_attention.research_attention import ResearchAttentionConfig
+
+config = ResearchAttentionConfig(
+    masker_configs=[],
+    kv_quantization_config=TurboQuantKVConfig(
+        key_quantizer=TurboQuantQuantizerConfig(bits=3, variant="prod"),
+        value_quantizer=TurboQuantQuantizerConfig(bits=3, variant="mse"),
+        store_codes=True,
+    ),
+)
+~~~
+
+Set store_codes=False for FAKE reconstructed storage with the same encoder and
+decoder. Packed request payloads contain:
+
+- MSE: ceil(N*b/8) index bytes and one FP32 original norm per vector.
+- Prod: ceil(N*(b-1)/8) coarse bytes (absent at b=1), ceil(N/8) sign bytes,
+  and two FP32 norms per vector.
+
+N is the number of scalar entries in a chunk. Thus nominal b excludes norm
+metadata: for complete heads, effective payload bits/channel are b+32/d for
+MSE and b+64/d for prod, plus each stream's final-byte padding. At d=128,
+3-bit MSE costs 3.25 bits/channel and 3-bit prod costs 3.5. This latter total
+is not evidence of reproducing the paper's fractional-bit outlier profile.
+
+store_bytes counts owned request tensor payloads, including both norm fields
+and packed signs. shared_state_bytes() separately counts owned codebook,
+rotation and projection tensor allocations on CPU/device without alias double
+counting. It excludes Python objects and inspection copies owned by callers.
+The demo prints both scopes and packed payload components. Neither measurement
+includes HF's native cache, weights or dense reconstruction temporaries.
+
+### Verification and remaining scope
+
+~~~bash
+python tutorials/py_examples/07_turboquant_kv_demo.py --device cpu
+python tutorials/py_examples/07_turboquant_kv_demo.py --device cpu --key-variant prod
+python -m pytest -q tests/unit/kv_quantization/test_turboquant*.py
+python -m pytest -q tests/integration/test_kv_quantization_turboquant_flow.py tests/integration/test_kv_quantization_benchmark_pipeline.py
+~~~
+
+Unit checks use analytic uniform/Gamma cases, independent incomplete-Beta
+conditional moments, higher quadrature order, exact logical indices/signs,
+independent reconstruction, QJL query/projection algebra, fixed-seed statistical
+unbiasedness checks, byte counts, serialization, corrupted records and numerical
+edge cases. NumPy FP64 formulas are checked separately from FP32 runtime
+roundoff. Reference tests use SciPy, already a dependency of the project's
+scikit-learn requirement; the runtime codec only requires PyTorch/NumPy.
+
+Tiny random Llama, Qwen3 and Mistral checks cover FP16/BF16/FP32, GQA,
+full/chunked prefill, single/multi-token decode, MSE/MSE and prod/MSE, native
+sliding input, eager/SDPA prefill, request isolation and cleanup after invalid
+decode. The real offline benchmark worker covers execution, diagnostics and
+configuration/results export. FAKE/PACKED logits must match exactly on the
+same backend. Codecs are checked independently; these local-model checks are
+not a pretrained task-quality benchmark.
+
+Validation on CPU with Python 3.10, PyTorch 2.8.0 and Transformers 4.57.1:
+
+- The focused regression command below passed **1,877 tests**, with **one
+  existing expected failure** for the deferred after-attention extension. It
+  includes KIVI, QuaRot, generic codecs, adapters and benchmark checks.
+- Both 3-bit MSE/MSE and prod/MSE demos produced identical FAKE/PACKED logits.
+- Black, isort and flake8 passed on 14 Python files changed for this method.
+  Four implementation modules passed focused mypy checks; their pylint score
+  was 9.36/10, above the configured threshold.
+- A wheel was built, extracted and imported outside the checkout. Its MSE/prod
+  packed prefill, exports and request cleanup passed an independent smoke run.
+
+~~~bash
+python -m pytest -q tests/unit/kv_quantization tests/integration/test_kv_quantization*.py tests/integration/test_kivi_reference_flow.py tests/unit/benchmark/test_config_serialization.py tests/unit/benchmark/test_quantization_test_categories.py tests/unit/benchmark/test_supported_runtime.py tests/unit/adapters
+~~~
+
+Remaining work before claiming published benchmark reproduction:
+
+- Resolve the v1 Section 4.3 outlier-selection, split lifetime and fractional-bit
+  settings from an authoritative implementation or clarified final version.
+  The printed 32-of-128 allocation example also has a bit-average arithmetic
+  inconsistency. We do not guess that missing profile or relabel our uniform one.
+- Evaluate pretrained LongBench/needle quality with pinned model/data settings.
+- Validate GPU precision/backend behavior and any future fused implementation.
+- Native low-bit attention, entropy coding and fused kernels are not implemented.
+  This path retains HF's unquantized cache and reconstructs dense K/V, so it makes
+  no claim of total GPU-memory savings or native quantized-attention speed.

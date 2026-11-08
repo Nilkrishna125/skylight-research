@@ -18,6 +18,9 @@ from sparse_attention_hub.kv_quantization import (
     KVQuantizationConfig,
     ParamDType,
     QuantGranularity,
+    QuaRotKVConfig,
+    TurboQuantKVConfig,
+    TurboQuantQuantizerConfig,
 )
 from sparse_attention_hub.sparse_attention.research_attention import (
     ResearchAttentionConfig,
@@ -48,7 +51,10 @@ def test_enum_values_are_exported_as_primitives(value, expected):
     assert result == expected and type(result) is type(expected)
 
 
-@pytest.mark.parametrize("config", [KVQuantizationConfig(), KIVIConfig()])
+@pytest.mark.parametrize(
+    "config",
+    [KVQuantizationConfig(), KIVIConfig(), QuaRotKVConfig(), TurboQuantKVConfig()],
+)
 def test_nested_configs_keep_class_identity_and_are_stable_across_instances(config):
     result = make_serializable(config)
     assert (
@@ -60,6 +66,20 @@ def test_nested_configs_keep_class_identity_and_are_stable_across_instances(conf
     if isinstance(config, KIVIConfig):
         assert result["key_quantizer"]["parameter_dtype"] == "input"
         assert len(result["key_quantizer"]["reference_revision"]) == 40
+    if isinstance(config, QuaRotKVConfig):
+        assert result["key_quantizer"]["parameter_dtype"] == "upstream_path"
+        assert result["key_quantizer"]["parameter_mode"] == "key_head"
+        assert result["value_quantizer"]["parameter_mode"] == "value_group"
+        assert result["key_transform"]["preserve_input_dtype"] is True
+        assert result["quantize_prefill"] is True
+    if isinstance(config, TurboQuantKVConfig):
+        assert result["key_quantizer"]["parameter_dtype"] == "fp32"
+        assert result["key_quantizer"]["variant"] == "mse"
+        assert result["key_quantizer"]["codebook_distribution"] == "sphere_beta"
+        assert (
+            result["key_quantizer"]["reference"] == "arxiv:2504.19874v1:algorithms-1-2"
+        )
+        assert result["key_transform"]["__type__"].endswith(".IdentityTransformConfig")
     assert result["key_quantizer"]["scale_dtype"] == "fp16"
     assert isinstance(result["key_quantizer"]["granularity"], str)
     text = json.dumps(result, sort_keys=True, allow_nan=False)
@@ -76,6 +96,17 @@ def test_dataclass_subclass_identity_is_not_lost_in_parent_configs():
 
     result = make_serializable(Experiment(KIVIConfig()))
     assert result["quantization"]["__type__"].endswith(".KIVIConfig")
+
+
+def test_turboquant_variant_and_seed_are_visible_in_exported_configuration():
+    config = TurboQuantKVConfig(
+        key_quantizer=TurboQuantQuantizerConfig(variant="prod", bits=4, qjl_seed=19)
+    )
+    result = json.loads(json.dumps(make_serializable(config), allow_nan=False))
+    assert result["key_quantizer"]["variant"] == "prod"
+    assert result["key_quantizer"]["bits"] == 4
+    assert result["key_quantizer"]["qjl_seed"] == 19
+    assert result["key_quantizer"]["numerics_version"].startswith("fp32-beta-")
 
 
 def test_types_functions_devices_and_paths_have_stable_representations():

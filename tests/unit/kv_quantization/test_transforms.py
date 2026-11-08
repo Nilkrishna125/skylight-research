@@ -35,6 +35,38 @@ def context(layer: int = 0, kind: str = "key") -> AttentionContext:
     return AttentionContext(layer, kind, 0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("preserve", [False, True])
+def test_hadamard_forward_dtype_is_explicit_and_inverse_uses_saved_dtype(
+    dtype, preserve
+):
+    from tests.reference.quarot import normalized_matrix
+
+    transform = HadamardTransform(
+        HadamardTransformConfig(preserve_input_dtype=preserve)
+    )
+    x = torch.randn(1, 2, 5, 256, generator=torch.Generator().manual_seed(812)).to(
+        dtype
+    )[..., ::2]
+    original = x.clone()
+    rotated, state = transform.forward(x, context())
+    expected = x.float() @ normalized_matrix(128)
+    if preserve:
+        expected = expected.to(dtype)
+    assert rotated.dtype == (dtype if preserve else torch.float32)
+    assert torch.equal(rotated, expected)
+    restored = transform.inverse(rotated, context(), state)
+    assert restored.dtype == dtype
+    expected_inverse = (expected.float() @ normalized_matrix(128).T).to(dtype)
+    assert torch.equal(restored, expected_inverse)
+    assert torch.equal(x, original)
+
+
+def test_hadamard_dtype_flag_must_be_boolean():
+    with pytest.raises(ValueError, match="boolean"):
+        HadamardTransform(HadamardTransformConfig(preserve_input_dtype=1))
+
+
 def gaussian(tokens: int = 128, seed: int = 0) -> torch.Tensor:
     torch.manual_seed(seed)
     return torch.randn(1, 2, tokens, DIM)

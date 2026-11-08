@@ -92,6 +92,18 @@ from .quantizers.implementations.nvfp4 import (  # noqa: F401
     NVFP4Quantizer,
     NVFP4QuantizerConfig,
 )
+from .quantizers.implementations.quarot import (  # noqa: F401
+    QUAROT_REFERENCE_REVISION,
+    QuaRotQuantizer,
+    QuaRotQuantizerConfig,
+)
+from .quantizers.implementations.turboquant import (  # noqa: F401
+    TURBOQUANT_NUMERICS,
+    TURBOQUANT_REFERENCE,
+    TurboQuantQuantizer,
+    TurboQuantQuantizerConfig,
+    turboquant_codebook,
+)
 from .registry import (  # noqa: F401
     CachePolicyRegistry,
     KVQuantizationRegistry,

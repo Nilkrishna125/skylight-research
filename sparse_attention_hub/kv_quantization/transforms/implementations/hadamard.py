@@ -15,6 +15,8 @@ from ..base import KVTransform, KVTransformConfig, apply_rotation
 class HadamardTransformConfig(KVTransformConfig):
     """Rotate each key/value vector by the normalized Hadamard matrix H."""
 
+    preserve_input_dtype: bool = False
+
 
 def hadamard_matrix(size: int) -> torch.Tensor:
     """Normalized Sylvester Hadamard matrix (``H @ H.T == I``); ``size`` a power of 2."""
@@ -36,8 +38,12 @@ class HadamardTransform(KVTransform):
     original coordinates exactly up to FP32 rounding.
     """
 
+    config: HadamardTransformConfig
+
     def __init__(self, config: HadamardTransformConfig) -> None:
         super().__init__(config)
+        if type(config.preserve_input_dtype) is not bool:
+            raise ValueError("preserve_input_dtype must be boolean")
         self._matrices: Dict[int, torch.Tensor] = {}
 
     def matrix(self, size: int) -> torch.Tensor:
@@ -48,7 +54,10 @@ class HadamardTransform(KVTransform):
     def forward(
         self, x: torch.Tensor, context: AttentionContext
     ) -> Tuple[torch.Tensor, Any]:
-        return apply_rotation(x, self.matrix(x.shape[-1])), x.dtype
+        rotated = apply_rotation(x, self.matrix(x.shape[-1]))
+        if self.config.preserve_input_dtype:
+            rotated = finite_cast(rotated, x.dtype)
+        return rotated, x.dtype
 
     def inverse(
         self, x: torch.Tensor, context: AttentionContext, state: Any

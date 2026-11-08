@@ -284,7 +284,8 @@ python -m pytest -q -m integration tests/integration/test_kv_quantization*.py te
 See the [quantization guide](sparse_attention_hub/kv_quantization/README.md) for
 implemented components, diagnostics and current limitations.
 The [method implementation notes](sparse_attention_hub/kv_quantization/implementations/README.md)
-describe KIVI's reference behavior and the status of the other recipes.
+describe KIVI, QuaRot KV and TurboQuant MSE/prod reference behavior and the status
+of other recipes.
 
 
 ## 📖 Documentation

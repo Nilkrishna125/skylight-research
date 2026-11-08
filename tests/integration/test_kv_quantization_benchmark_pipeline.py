@@ -11,14 +11,18 @@ import torch
 from benchmark import executor
 from benchmark.base import Benchmark
 from benchmark.executor_config import AdapterConfig, BenchmarkStub
-from sparse_attention_hub.adapters import huggingface
+from sparse_attention_hub.adapters import Request, huggingface
 from sparse_attention_hub.kv_quantization import (
     CACHE_KEY,
     DefaultCachePolicyConfig,
     HadamardTransformConfig,
     KIVIConfig,
     KVQuantizationConfig,
+    QuaRotKVConfig,
+    QuaRotQuantizerConfig,
     RegionConfig,
+    TurboQuantKVConfig,
+    TurboQuantQuantizerConfig,
 )
 from sparse_attention_hub.kv_quantization.metrics.quant_error import METRIC_IDS
 from sparse_attention_hub.metric_logging import MicroMetricLogger
@@ -35,6 +39,60 @@ from tests.integration.test_kv_quantization_workflow_matrix import (
 
 pytestmark = pytest.mark.integration
 tiny_model_dir = shared_tiny_model_dir
+
+
+@pytest.mark.parametrize("method_name", ["quarot", "turboquant"])
+def test_invalid_decode_releases_prefill_store(
+    tiny_model_dir, monkeypatch, method_name
+):
+    config = (
+        QuaRotKVConfig(
+            key_quantizer=QuaRotQuantizerConfig(
+                group_size=32, parameter_mode="key_head"
+            ),
+            value_quantizer=QuaRotQuantizerConfig(group_size=32),
+        )
+        if method_name == "quarot"
+        else TurboQuantKVConfig()
+    )
+    adapter = huggingface.ModelAdapterHF(
+        model_name=tiny_model_dir,
+        sparse_attention_config=ResearchAttentionConfig(
+            masker_configs=[], kv_quantization_config=config
+        ),
+        device="cpu",
+    )
+    method = adapter.sparse_attention.kv_quantization
+    original_process = method.process
+    original_clear = adapter.sparse_attention.clear_request_state
+    released = []
+
+    def invalid_decode(layer, keys, values, metadata, **kwargs):
+        if kwargs["phase"] == "decode":
+            keys = keys.clone()
+            keys[..., -1, 0] = float("nan")
+        return original_process(layer, keys, values, metadata, **kwargs)
+
+    def clear(metadata):
+        store = metadata[CACHE_KEY]
+        assert store.layers
+        original_clear(metadata)
+        released.append((metadata, store))
+
+    monkeypatch.setattr(method, "process", invalid_decode)
+    monkeypatch.setattr(adapter.sparse_attention, "clear_request_state", clear)
+    try:
+        with pytest.raises(ValueError, match="NaN or infinity"):
+            adapter.process_request(
+                Request(context="w1 w2 w3 w4", questions="w5 w6", answer_prefix=""),
+                generation_kwargs={"max_new_tokens": 2},
+                request_kwargs={},
+            )
+        assert len(released) == 1
+        metadata, store = released[0]
+        assert CACHE_KEY not in metadata and not store.layers
+    finally:
+        adapter._cleanup_attention_registration()
 
 
 class OfflineWorkflowBenchmark(Benchmark):
@@ -58,7 +116,16 @@ class OfflineWorkflowBenchmark(Benchmark):
         return {"completed_fixture_questions": len(results_df)}
 
 
-@pytest.mark.parametrize("codec", [*CODECS, pytest.param(None, id="kivi")])
+@pytest.mark.parametrize(
+    "codec",
+    [
+        *CODECS,
+        pytest.param(None, id="kivi"),
+        pytest.param("quarot", id="quarot"),
+        pytest.param("turboquant_mse", id="turboquant_mse"),
+        pytest.param("turboquant_prod", id="turboquant_prod"),
+    ],
+)
 @pytest.mark.parametrize("packed", [False, True])
 def test_real_benchmark_worker_with_local_model_and_saved_outputs(
     codec, packed, tiny_model_dir, monkeypatch, tmp_path
@@ -70,6 +137,21 @@ def test_real_benchmark_worker_with_local_model_and_saved_outputs(
         quant = KIVIConfig.with_settings(
             group_size=4,
             residual_length=8,
+            store_codes=packed,
+            error_metric=True,
+        )
+    elif codec in ("turboquant_mse", "turboquant_prod"):
+        quant = TurboQuantKVConfig(
+            key_quantizer=TurboQuantQuantizerConfig(variant=codec.rsplit("_", 1)[1]),
+            store_codes=packed,
+            error_metric=True,
+        )
+    elif isinstance(codec, str):
+        quant = QuaRotKVConfig(
+            key_quantizer=QuaRotQuantizerConfig(
+                group_size=32, parameter_mode="key_head"
+            ),
+            value_quantizer=QuaRotQuantizerConfig(group_size=32),
             store_codes=packed,
             error_metric=True,
         )
@@ -156,9 +238,16 @@ def test_real_benchmark_worker_with_local_model_and_saved_outputs(
         exported = json.loads((tmp_path / "config.json").read_text())
         saved_quant = exported["sparse_attention_config"]["kv_quantization_config"]
         assert saved_quant["store_codes"] == packed
-        assert saved_quant["__type__"].endswith(
-            ".KIVIConfig" if codec is None else ".KVQuantizationConfig"
+        expected_class = (
+            "KIVIConfig"
+            if codec is None
+            else "TurboQuantKVConfig"
+            if codec in ("turboquant_mse", "turboquant_prod")
+            else "QuaRotKVConfig"
+            if isinstance(codec, str)
+            else "KVQuantizationConfig"
         )
+        assert saved_quant["__type__"].endswith("." + expected_class)
         events = [
             json.loads(line)
             for line in (tmp_path / "micro_metrics.jsonl").read_text().splitlines()

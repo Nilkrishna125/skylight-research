@@ -100,6 +100,34 @@ class KVQuantization:
         offline codec experiments. Prefill is captured even when attention itself
         stays full precision; storage updates cannot alter this call's snapshot.
         """
+        return self._process_kv_history(
+            layer_idx,
+            keys,
+            values,
+            meta_data,
+            num_new_tokens=num_new_tokens,
+            phase=phase,
+            position_ids=position_ids,
+            reconstruct_current=False,
+        )
+
+    def _process_kv_history(
+        self,
+        layer_idx: int,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        meta_data: Dict[str, Any],
+        *,
+        num_new_tokens: int,
+        reconstruct_current: bool,
+        phase: str = "decode",
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Import, compress and reconstruct the request's independent KV history.
+
+        KIVI uses exact current-call tokens; reconstruct_current instead returns
+        the stored reconstruction after compressing those arriving tokens too.
+        """
         if (
             not isinstance(layer_idx, int)
             or isinstance(layer_idx, bool)
@@ -166,15 +194,19 @@ class KVQuantization:
                 "Missing cached history; capture prefill or start a fresh request"
             )
 
-        if store.seen_tokens(layer_idx):
-            previous_keys, previous_values = store.get(layer_idx, self._decode_chunk)
-        else:
-            previous_keys, previous_values = keys[..., :0, :], values[..., :0, :]
         new_keys = keys[..., past_in_input:, :]
         new_values = values[..., past_in_input:, :]
-        attention_keys = torch.cat([previous_keys, new_keys], dim=-2)
-        attention_values = torch.cat([previous_values, new_values], dim=-2)
-        # These tensors own their data before append/compress can change the store.
+        attention_keys, attention_values = keys, values
+        if not reconstruct_current:
+            if store.seen_tokens(layer_idx):
+                previous_keys, previous_values = store.get(
+                    layer_idx, self._decode_chunk
+                )
+            else:
+                previous_keys, previous_values = keys[..., :0, :], values[..., :0, :]
+            attention_keys = torch.cat([previous_keys, new_keys], dim=-2)
+            attention_values = torch.cat([previous_values, new_values], dim=-2)
+            # The snapshot owns its data before compression can change the store.
         imported = store.append(layer_idx, new_keys, new_values, encode)
         record_trace(
             meta_data,
@@ -191,9 +223,15 @@ class KVQuantization:
             phase,
             position_ids,
         )
+        if reconstruct_current:
+            attention_keys, attention_values = store.get(layer_idx, self._decode_chunk)
         record_trace(
             meta_data,
-            "KVQuantization.process: previous history + original new KV",
+            (
+                "KVQuantization.process: reconstructed history including new KV"
+                if reconstruct_current
+                else "KVQuantization.process: previous history + original new KV"
+            ),
             layer=layer_idx,
             new_tokens=num_new_tokens,
         )

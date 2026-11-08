@@ -17,24 +17,29 @@ buffer boundaries, native sliding caches, mask alignment, fake/packed logit pari
 and cleanup. These are numerical/integration checks, not a language-quality benchmark.
 The [KIVI implementation note](implementations/README.md#kivi)
 describes the pinned reference codec, numerical checks and validation limits.
+The [QuaRot KV implementation note](implementations/README.md#quarot-kv) describes
+its accuracy-profile quantizer and original-coordinate reconstruction.
+The [TurboQuant KV implementation note](implementations/README.md#turboquant-kv) describes
+its MSE and QJL-corrected prod algorithms, bit budget and validation limits.
 The optional after-attention hook remains deferred.
 
 The actual call flow is:
 
 ```text
-Context prefill: capture all K/V -> store for later calls -> original native attention
+Context prefill: capture all K/V -> store -> native attention on original or prepared K/V
 HF decode: RoPE -> native cache.update -> attention registry callback
   adapters/huggingface.py: custom_attention_callable (adds layer_idx, sparse_meta_data)
     research_attention/base.py: ResearchAttention.custom_attention
       sparse_attention/base.py: SparseAttention.quantize_kv (returns K, V unchanged when off)
-        kv_quantization/base.py: KVQuantization.process
-          reconstruct previous stored history + this call's original new K/V
+        kv_quantization/: method.process -> shared _process_kv_history
+          default/KIVI: snapshot previous reconstruction + exact arriving K/V
           cache/store.py: append the query-count suffix, independently for each layer
           policies/cache/: decide which K/V tokens leave the local window
           transforms/: forward transform
           policies/precision/: precision plan
           quantizers/: encode + pack, with per-group parameters
-          return the attention tensors prepared before updating the store
+          QuaRot/TurboQuant: reconstruct history including arriving tokens after compression
+          return the method-selected attention tensors
       align HF's suffix mask with the returned full history
       maskers + attention on the reconstructed K, V (every layer, before layer gating)
   adapters/huggingface.py: per-question finally -> SparseAttention.clear_request_state
@@ -74,6 +79,8 @@ kv_quantization/
 │   └── implementations/
 │       ├── integer.py
 │       ├── kivi.py                 # Released KIVI numerical rules
+│       ├── quarot.py               # Released QuaRot accuracy-path numerics
+│       ├── turboquant.py           # Sphere MSE codebooks and QJL-corrected prod
 │       ├── fp8.py
 │       ├── nvfp4.py
 │       ├── fake_nvfp4.py
@@ -108,12 +115,12 @@ kv_quantization/
 | `registry.py` | Independent config-type factories; implementations use their registration decorators |
 | `context.py` | `AttentionContext` and opt-in tracing; metadata only, no KV storage |
 | `transforms/` | `KVTransform`; working Identity, Hadamard, RandomHadamard and RandomRotation; LearnedRotation scaffolded |
-| `quantizers/` | `KVQuantizer`, `QuantGranularity`; working INT, FP8, FakeNVFP4, MXFP and nonuniform reference codecs; native NVFP4 scaffold |
+| `quantizers/` | `KVQuantizer`, `QuantGranularity`; working INT, KIVI, QuaRot, TurboQuant MSE/prod, FP8, FakeNVFP4, MXFP and nonuniform reference codecs; native NVFP4 scaffold |
 | `policies/precision/` | `PrecisionPolicy`, `PrecisionPlan`; fixed bits, mixed-channel bits and optional exact-token preservation |
 | `policies/cache/` | `CachePolicy`, `RegionConfig` (sink/local size and quantizer), and six working policies (Default, SinkAndLocal, Kitty, SinkOnly, FullQuantization, LocalOnly) |
 | `cache/` | `QuantizedKVStore`, per-layer state, encoded tensor records and chunks |
 | `metrics/quant_error.py` | Optional reconstruction errors on quantized regions; stored tensor bytes |
-| `implementations/` | KIVI, QuaRotKV, TurboQuantKV, KVQuantNUQ, Kitty and NVFP4KV method declarations |
+| `implementations/` | Implemented KIVI/QuaRotKV/TurboQuantKV recipes; KVQuantNUQ, Kitty and NVFP4KV declarations |
 
 For example, `implementations/kivi.py` assembles the complete method from
 components, selecting `KIVIQuantizerConfig` by default and
@@ -303,35 +310,41 @@ encoder/decoder, rather than two different rounding implementations.
 
 ## Transforms
 
-Each transform rotates every key/value vector along `head_dim` before quantization
-and rotates it back after decoding. All are orthogonal, computed in FP32, and return
-the input's original dtype.
+Outer transforms rotate each key/value vector along `head_dim` before quantization
+and rotates it back after decoding. Rotations compute in FP32; the inverse
+restores the original dtype. Hadamard forward can also cast to the input dtype
+with preserve_input_dtype=True, as selected by QuaRot.
 
 | Transform (config) | Rotation | Used by |
 |---|---|---|
 | `IdentityTransform` | none (default) | most methods |
-| `HadamardTransform` | normalized Hadamard `H`; `head_dim` must be a power of 2 | |
-| `RandomHadamardTransform` (`seed`) | `diag(s) @ H` with random signs `s` | QuaRot |
+| `HadamardTransform` | normalized Hadamard `H`; `head_dim` must be a power of 2 | QuaRot KV (preserve_input_dtype=True) |
+| `RandomHadamardTransform` (`seed`) | `diag(s) @ H` with random signs `s` | Generic experiments |
 | `RandomRotation` (`seed`) | random orthogonal matrix (QR of a Gaussian) | TurboQuant |
 
-The random transforms derive one rotation per (layer, keys/values) from `seed`, so
-runs are reproducible and keys and values never share a rotation. Rotations spread
-outlier channels over all channels, which lowers per-token quantization error.
+The random transforms derive reproducible rotations per (layer, keys/values)
+from `seed`. TurboQuant selects identity outer transforms and reuses RandomRotation
+internally, normalizing original vectors before rotation and computing QJL
+residuals in original coordinates. Rotation spreads channel magnitudes; it does
+not guarantee lower error for every individual vector.
 
 ## Intentionally pending
 
 Learned rotations, the native NVFP4 codec, coordinator-level calibration, and the
-QuaRotKV, TurboQuantKV, KVQuantNUQ, Kitty and NVFP4KV paper recipes still raise
+KVQuantNUQ, Kitty and NVFP4KV paper recipes still raise
 `NotImplementedError` when selected. Their classes, configs and registry entries
 are ready for focused implementations. Generic FP8/FakeNVFP4/MXFP/nonuniform
 codecs, ChannelBoost and OutlierTokenPolicy are implemented; their existence does
 not establish paper-reference parity. KIVI's portable reference path is implemented
-and numerically checked. Its shared buffer is `SinkAndLocalCachePolicy`.
+and numerically checked. QuaRot KV also has a portable, source-checked
+accuracy-profile implementation; see its implementation note for scope.
+KIVI's shared buffer is `SinkAndLocalCachePolicy`.
 `KittyCachePolicy` is currently a generic helper whose value-page buffering and
 per-page precision selection still need correction for the released Kitty recipe.
 KVQuant requires calibrated codebooks and per-element
-outliers; keys are quantized post-RoPE (no RoPE inversion). TurboQuantKV is
-reserved for the MSE variant, not QJL inner-product estimation.
+outliers; keys are quantized post-RoPE (no RoPE inversion). TurboQuantKV implements
+both uniform MSE and QJL-corrected prod profiles; fractional-bit outlier profiles
+are not reproduced.
 
 Mixed precision is an explicit `PrecisionPlan` extension. The working codec
 rejects per-entry assignments until their packing/layout is implemented.
@@ -366,8 +379,11 @@ and padding visibility is preserved by mask alignment.
 
 With `quantize_prefill=False`, direct prefill returns original K/V while still
 capturing storage. With True, earlier cached chunks can be reconstructed during
-chunked prefill; current-call tokens remain original. Adapter capture-only prefill
-uses native attention in both cases. These settings do not establish paper fidelity.
+chunked prefill. Default/KIVI processing keeps current-call tokens exact; QuaRot
+and TurboQuant override process() to reconstruct those tokens too. Adapter
+capture-only prefill uses native attention with the method-prepared K/V when
+quantize_prefill=True and original K/V otherwise. These settings alone do not
+establish paper fidelity.
 
 HF's original full-precision cache remains allocated. Store bytes describe only
 additional owned tensor storage (not Python objects or temporary decoded K/V).

@@ -27,6 +27,8 @@ class QuantizedTensor:
     outlier_indices: Optional[torch.Tensor] = None
     outlier_values: Optional[torch.Tensor] = None
     group_bits: Optional[torch.Tensor] = None  # bits per group, for mixed precision
+    qjl_codes: Optional[torch.Tensor] = None  # Packed one-bit residual signs.
+    residual_norms: Optional[torch.Tensor] = None  # Unit-vector residual magnitudes.
 
     def storage_bytes(self) -> int:
         """Tensor storage only; excludes Python objects and shared calibration data."""
@@ -40,6 +42,8 @@ class QuantizedTensor:
             self.outlier_indices,
             self.outlier_values,
             self.group_bits,
+            self.qjl_codes,
+            self.residual_norms,
         ]
         return sum(t.numel() * t.element_size() for t in tensors if t is not None)
 

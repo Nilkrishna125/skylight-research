@@ -14,6 +14,8 @@ from sparse_attention_hub.kv_quantization import (
     OutlierTokenPolicyConfig,
     QuantGranularity,
     RegionConfig,
+    TurboQuantKVConfig,
+    TurboQuantQuantizerConfig,
 )
 
 pytestmark = pytest.mark.unit
@@ -157,3 +159,30 @@ def test_fake_kept_tokens_survive_later_attention_and_storage_updates():
     assert store.stats()["store_bytes"] == allocated_tensor_bytes(store) == 4096
     for chunk in chunks(store):
         assert chunk.kept_index is None and chunk.kept_values is None
+
+
+@pytest.mark.parametrize("variant", ["mse", "prod"])
+@pytest.mark.parametrize("packed", [False, True])
+def test_turboquant_payload_allocation_count_includes_norms_and_sketches(
+    variant, packed
+):
+    method = KVQuantization.create_from_config(
+        TurboQuantKVConfig(
+            key_quantizer=TurboQuantQuantizerConfig(variant=variant),
+            store_codes=packed,
+        )
+    )
+    generator = torch.Generator().manual_seed(972)
+    metadata = {}
+    for layer, length in ((0, 5), (1, 5), (0, 1), (1, 1)):
+        x = torch.randn(2, 3, length, 17, generator=generator).half()
+        method.process(layer, x, x.clone(), metadata, num_new_tokens=length)
+        store = metadata[CACHE_KEY]
+        assert store.stats()["store_bytes"] == allocated_tensor_bytes(store)
+        if packed:
+            for chunk in chunks(store):
+                record = chunk.quantized
+                assert record.norms is not None
+                assert (record.qjl_codes is not None) is (
+                    variant == "prod" and chunk.context.tensor_kind == "key"
+                )

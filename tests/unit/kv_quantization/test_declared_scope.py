@@ -12,8 +12,6 @@ from sparse_attention_hub.kv_quantization import (
     LearnedRotationConfig,
     NVFP4KVConfig,
     NVFP4QuantizerConfig,
-    QuaRotKVConfig,
-    TurboQuantKVConfig,
 )
 
 pytestmark = pytest.mark.unit
@@ -24,8 +22,6 @@ pytestmark = pytest.mark.unit
     [
         KittyConfig(),
         KVQuantNUQConfig(),
-        QuaRotKVConfig(),
-        TurboQuantKVConfig(),
         NVFP4KVConfig(),
     ],
 )

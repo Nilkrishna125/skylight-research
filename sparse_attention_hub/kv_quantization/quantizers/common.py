@@ -178,6 +178,56 @@ def unpack_codes(packed: torch.Tensor, bits: int, code_count: int) -> torch.Tens
     return flat[:code_count]
 
 
+def pack_bitstream(codes: torch.Tensor, bits: int) -> Tuple[torch.Tensor, int]:
+    """Pack unsigned codes across byte boundaries, lowest bits first.
+
+    Uses ceil(code_count * bits / 8) bytes, including at three bits. Existing
+    codecs retain their original pack_codes byte layout.
+    """
+    if type(bits) is not int or not 1 <= bits <= 8:
+        raise ValueError("bits must be an integer in [1, 8]")
+    if codes.is_complex():
+        raise ValueError("Codes must be real integers")
+    if codes.is_floating_point():
+        if not torch.isfinite(codes).all() or (codes != codes.round()).any():
+            raise ValueError("Codes must be finite integers")
+    values = codes.flatten().to(torch.int64)
+    if ((values < 0) | (values >= 2**bits)).any():
+        raise ValueError("Codes are outside their unsigned range")
+    count = values.numel()
+    positions = torch.arange(count, device=values.device) * bits
+    indices, shifts = positions // 8, positions % 8
+    output = torch.zeros(
+        (count * bits + 7) // 8, dtype=torch.int64, device=values.device
+    )
+    output.scatter_add_(0, indices, (values << shifts) & 255)
+    crosses = shifts + bits > 8
+    output.scatter_add_(
+        0, indices[crosses] + 1, values[crosses] >> (8 - shifts[crosses])
+    )
+    return output.to(torch.uint8).contiguous(), count
+
+
+def unpack_bitstream(packed: torch.Tensor, bits: int, code_count: int) -> torch.Tensor:
+    """Decode a bitstream, checking its count and zero tail padding."""
+    if type(bits) is not int or not 1 <= bits <= 8:
+        raise ValueError("bits must be an integer in [1, 8]")
+    if type(code_count) is not int or code_count < 0:
+        raise ValueError("code_count must be a nonnegative integer")
+    if packed.dtype != torch.uint8 or packed.ndim != 1:
+        raise ValueError("Expected a one-dimensional uint8 stream")
+    if packed.numel() != (code_count * bits + 7) // 8:
+        raise ValueError("Byte count does not match code_count")
+    used_tail_bits = (code_count * bits) % 8
+    if used_tail_bits and int(packed[-1]) >> used_tail_bits:
+        raise ValueError("Unused tail bits must be zero")
+    data = torch.cat([packed.to(torch.int64), packed.new_zeros(1, dtype=torch.int64)])
+    positions = torch.arange(code_count, device=packed.device) * bits
+    indices, shifts = positions // 8, positions % 8
+    window = data[indices] | (data[indices + 1] << 8)
+    return ((window >> shifts) & (2**bits - 1)).to(torch.int16)
+
+
 def store_param(
     values: torch.Tensor, dtype: ParamDType, *, kind: str = "scale"
 ) -> torch.Tensor:
